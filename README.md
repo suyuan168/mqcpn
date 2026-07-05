@@ -1,0 +1,688 @@
+<p align="center">
+  <img src="website/public/img/mqvpn-lockup-violet-light.svg" alt="mqvpn" width="400">
+</p>
+
+Multipath QUIC VPN using [MASQUE CONNECT-IP (RFC 9484)](https://www.rfc-editor.org/rfc/rfc9484) over [HTTP Datagrams (RFC 9297)](https://www.rfc-editor.org/rfc/rfc9297) / [QUIC DATAGRAMs (RFC 9221)](https://www.rfc-editor.org/rfc/rfc9221), built on a [fork of XQUIC](https://github.com/mp0rta/xquic/tree/mqvpn-main) with [Multipath QUIC](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/).
+
+## Features
+
+- **Multipath** — Bind multiple interfaces (WiFi + LTE, dual ISP). Seamless failover and bandwidth aggregation via WLB or WRTT scheduler.
+- **Standards-based** — MASQUE CONNECT-IP (RFC 9484), no proprietary tunnel format.
+- **Dual-stack** — IPv4 + IPv6 inside the tunnel.
+- **Multi-Platform** — Available on Linux (server/client), Windows (client only) and Android (client only) support.
+- **PSK auth** — Pre-shared key over TLS 1.3.
+- **DNS override** — Prevents DNS leaks. Uses `resolvectl` on systemd-resolved systems, falls back to resolv.conf.
+
+## Installation
+
+### Server
+
+```bash
+git clone --recurse-submodules https://github.com/mp0rta/mqvpn.git
+cd mqvpn && ./build.sh
+
+# Server
+sudo scripts/start_server.sh
+# → Generated auth key example: mPyVpoQWcp/5gr404xvS19aRC03o0XS2mrb2tZJ1Ii4=
+
+# Client (single path)
+sudo ./build/mqvpn --mode client --server 203.0.113.1:443 \
+    --auth-key mPyVpoQWcp/5gr404xvS19aRC03o0XS2mrb2tZJ1Ii4= --insecure
+
+# Client (multipath)
+sudo ./build/mqvpn --mode client --server 203.0.113.1:443 \
+    --auth-key mPyVpoQWcp/5gr404xvS19aRC03o0XS2mrb2tZJ1Ii4= --path eth0 --path wlan0 --insecure
+
+# Client (multipath + backup failover path)
+sudo ./build/mqvpn --mode client --server 203.0.113.1:443 \
+    --auth-key mPyVpoQWcp/5gr404xvS19aRC03o0XS2mrb2tZJ1Ii4= --path eth0 --backup-path lte0 --insecure
+
+# Client (with DNS override)
+sudo ./build/mqvpn --mode client --server 203.0.113.1:443 \
+    --auth-key mPyVpoQWcp/5gr404xvS19aRC03o0XS2mrb2tZJ1Ii4= --dns 1.1.1.1 --dns 8.8.8.8 --insecure
+
+# Server (dual-stack — IPv4 + IPv6)
+sudo scripts/start_server.sh --subnet 10.0.0.0/24 --subnet6 fd00:abcd::/112
+```
+
+This downloads the latest release, installs the binary, and generates a self-signed TLS certificate, auth key, and server config at `/etc/mqvpn/server.conf`. Add `--start` to start the server and register it for automatic startup on boot:
+
+```bash
+curl -fsSL https://github.com/mp0rta/mqvpn/releases/latest/download/install.sh \
+    | sudo bash -s -- --start
+```
+
+> **Note:** The self-signed certificate requires `--insecure` on the client. For production, replace with a trusted certificate (e.g. Let's Encrypt) and omit `--insecure`.
+
+Options can be combined:
+
+```bash
+curl -fsSL https://github.com/mp0rta/mqvpn/releases/latest/download/install.sh \
+    | sudo bash -s -- --start --port 10020 --subnet 10.8.0.0/24
+```
+
+Uninstall: re-run the install script with `--uninstall`.
+```bash
+curl -fsSL https://github.com/mp0rta/mqvpn/releases/latest/download/install.sh \
+    | sudo bash -s -- --uninstall
+```
+
+### Client (deb package)
+
+Download the latest `.deb` from [Releases](https://github.com/mp0rta/mqvpn/releases/latest):
+
+```bash
+# Replace VERSION and ARCH as needed (e.g., 0.6.0, amd64)
+curl -LO https://github.com/mp0rta/mqvpn/releases/latest/download/mqvpn_VERSION_ARCH.deb
+sudo dpkg -i mqvpn_*.deb
+```
+
+### Windows client
+
+Pre-built binaries are shipped for Windows amd64 and arm64. Download `mqvpn_<VERSION>_windows_<ARCH>.zip` from [Releases](https://github.com/mp0rta/mqvpn/releases/latest), extract, and follow the bundled `README.txt` (admin PowerShell required).
+
+## Quick Start
+
+After installing the server and client (see [Installation](#installation)):
+
+```bash
+# Client (single path)
+sudo mqvpn --mode client --server YOUR_SERVER:443 \
+    --auth-key YOUR_AUTH_KEY --insecure
+
+# Client (multipath)
+sudo mqvpn --mode client --server YOUR_SERVER:443 \
+    --auth-key YOUR_AUTH_KEY --path eth0 --path wlan0 --insecure
+
+# Client (with DNS override)
+sudo mqvpn --mode client --server YOUR_SERVER:443 \
+    --auth-key YOUR_AUTH_KEY --dns 1.1.1.1 --dns 8.8.8.8 --insecure
+```
+
+> **Notes:**
+> - On Linux, without `--path`, the client uses the default interface (single path); multipath requires two or more `--path` flags. On Windows, `--path` is always required (one or more); see `docs/windows_build.md`.
+> - The server needs its listen port open for UDP (default: 443). All client traffic is routed through the tunnel.
+
+## Configuration
+
+Config files support both INI and JSON. CLI arguments override config values.
+
+```ini
+# /etc/mqvpn/server.conf
+[Interface]
+Listen = 0.0.0.0:443
+Subnet = 10.0.0.0/24
+Subnet6 = 2001:db8:1::/112
+# MTU = 1280                   # TUN MTU (1280–9000, default: auto = ~1382)
+
+[TLS]
+Cert = /etc/mqvpn/server.crt
+Key = /etc/mqvpn/server.key       # TLS private key (PEM file)
+# Cipher = TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384
+
+[Auth]
+Key = mPyVpoQWcp/5gr404xvS19aRC03o0XS2mrb2tZJ1Ii4=   # PSK example (mqvpn --genkey)
+User = alice:alice-secret
+User = bob:bob-secret
+User = carol:carol-secret:10.0.0.50   # fixed IP — always assigned this address
+
+[Multipath]
+Scheduler = wlb
+# Scheduler = wrtt              # weighted RTT aggregation (set per-path weights via control API)
+# ReinjectionControl = true
+# ReinjectionMode = default   # default|deadline|dgram
+# FecEnable = true
+# FecScheme = reed_solomon    # galois_calculation|packet_mask|reed_solomon|xor
+# CC = bbr2                   # bbr2|bbr|cubic|new_reno|copa|unlimited (default: bbr2)
+
+[Control]
+# Port = 9090          # enable JSON control API on this TCP port
+# Addr = 127.0.0.1    # bind address (default: 127.0.0.1, loopback only)
+```
+
+```ini
+# /etc/mqvpn/client.conf
+[Server]
+Address = 203.0.113.1:443
+# ServerName = vpn.example.com  # TLS SNI / cert verify name (default: use Address host)
+
+[TLS]
+# Cipher = TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256
+
+[Auth]
+Key = mPyVpoQWcp/5gr404xvS19aRC03o0XS2mrb2tZJ1Ii4=
+# User = alice             # optional: identifies this client on the server (shown in status/logs)
+
+[Interface]
+DNS = 1.1.1.1, 8.8.8.8
+# RouteViaServer = false   # add a host route to the server IP before setting the default route
+# NoRoutes = false         # skip all automatic route setup (manage routes manually)
+# MTU = 1280               # TUN MTU (1280–9000, default: auto = ~1382)
+
+[Multipath]
+Scheduler = wlb
+# Scheduler = wrtt              # weighted RTT aggregation (set per-path weights via control API)
+# ReinjectionControl = true
+# ReinjectionMode = deadline  # default|deadline|dgram
+# FecEnable = true
+# FecScheme = xor             # galois_calculation|packet_mask|reed_solomon|xor
+# CC = bbr2                   # bbr2|bbr|cubic|new_reno|copa|unlimited (default: bbr2)
+Path = eth0
+Path = wlan0
+# BackupPath = lte0   # failover-only: used only when all primary paths are down
+
+[Control]
+# Port = 9091          # enable JSON control API on this TCP port
+# Addr = 127.0.0.1    # bind address (default: 127.0.0.1, loopback only)
+```
+
+### JSON config
+
+The loader auto-detects JSON files (first non-space char is `{`).
+
+Server example:
+
+```json
+{
+    "mode": "server",
+    "listen": "0.0.0.0:443",
+    "subnet": "10.0.0.0/24",
+    "subnet6": "fd00:abcd::/112",
+    "cert_file": "/etc/mqvpn/server.crt",
+    "key_file": "/etc/mqvpn/server.key",
+    "cipher": "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384",
+    "auth_key": "legacy-fallback-key",
+    "users": [
+        { "name": "alice", "key": "alice-secret" },
+        { "name": "carol", "key": "carol-secret", "fixed_ip": "10.0.0.50" },
+        "bob:bob-secret"
+    ],
+    "max_clients": 64,
+    "scheduler": "wlb",
+    "cc": "bbr2",
+    "fec_enable": true,
+    "fec_scheme": "reed_solomon",
+    "mtu": 1280,
+    "control_port": 9090,
+    "control_addr": "127.0.0.1"
+}
+```
+
+Client example:
+
+```json
+{
+    "mode": "client",
+    "server_addr": "203.0.113.1:443",
+    "tls_server_name": "vpn.example.com",
+    "auth_key": "client-key",
+    "auth_username": "alice",
+    "cipher": "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256",
+    "insecure": false,
+    "dns": ["1.1.1.1", "8.8.8.8"],
+    "paths": ["eth0", "wlan0"],
+    "backup_paths": ["lte0"],
+    "reconnect": true,
+    "reconnect_interval": 5,
+    "kill_switch": false,
+    "route_via_server": false,
+    "no_routes": false,
+    "scheduler": "wlb",
+    "cc": "bbr2",
+    "mtu": 1280,
+    "reinjection_control": true,
+    "reinjection_mode": "deadline",
+    "fec_enable": true,
+    "fec_scheme": "xor",
+    "control_port": 0,
+    "control_addr": "127.0.0.1"
+}
+```
+
+Notes:
+- `users` is server-side auth and accepts either objects (`{"name","key"}` or `{"name","key","fixed_ip"}`) or `"name:key"` strings.
+- A `fixed_ip` in a user object pins that IPv4 address to the user. The address is removed from the dynamic pool at startup and never assigned to other clients. The INI equivalent is `User = name:key:fixed_ip`.
+- `auth_key` remains supported as a single legacy/global key.
+- `auth_username` is client-side only: the name sent to the server for identification in logs and status output. It does not affect authentication.
+- `mode` is optional if it can be inferred (`listen` implies server).
+- `manage_routes` defaults to `true`; set it to `false` on router/embedded integrations where an external orchestrator owns the host routing table and mqvpn should only bring up the TUN.
+- **[mqvpn-prometheus-exporter](https://github.com/mp0rta/mqvpn-prometheus-exporter) requires per-user keys.** Using mqvpn-prometheus-exporter, you can correct and visualize mqvpn metrics. If you use it, sharing a single `auth_key` across
+  multiple clients works for the VPN data plane, but the control API
+  surfaces those sessions as `user="(global)"` and the Prometheus exporter
+  cannot distinguish them — series labels collide and the scrape is
+  dropped. For multi-client deployments register each client under `users`
+  (or via `add_user` over the control API) so each gets a distinct `user`
+  label.
+
+```bash
+sudo mqvpn --config /etc/mqvpn/server.conf
+sudo mqvpn --config /etc/mqvpn/client.conf
+```
+
+## Schedulers
+
+| Scheduler       | TCP              | UDP              | Typical use                                               |
+|-----------------|------------------|------------------|-----------------------------------------------------------|
+| `minrtt`        | min RTT          | min RTT          | latency-first                                             |
+| `wlb` (default) | flow pin         | unpinned         | general use; UDP packets distributed per-packet           |
+| `wlb_udp_pin`   | flow pin         | flow pin         | each UDP connection kept on a single path                 |
+| `wrtt`          | weight × RTT     | weight × RTT     | weighted aggregation; RTT as tiebreaker when weights equal |
+| `backup_fec`    | redundant        | redundant        | resilience-first (requires XQC_ENABLE_FEC)                |
+
+**Choosing wlb vs wlb_udp_pin:** Plain `wlb` distributes UDP packets across
+paths per-packet, which gives better aggregate throughput when the inner
+protocol tolerates reorder. Some inner UDP protocols, however, maintain their
+own packet ordering and may treat reorder as packet loss — under asymmetric-RTT
+paths this can slow them down and throughput drops. `wlb_udp_pin` keeps each
+UDP connection on a single path to avoid that case. If you observe degraded UDP
+throughput under `wlb`, try `wlb_udp_pin`; otherwise `wlb` is the better
+default.
+
+**Trade-off note (`wlb_udp_pin`):** the xquic WLB flow table is a fixed 4096-entry
+open-addressed structure with 60s idle eviction. Workloads with very high
+short-flow UDP churn (e.g. high-rate DNS, mDNS bursts) may evict longer-lived
+inner flows under probe-region pressure. `wlb_udp_pin` is intended for tunnels
+carrying a small-to-moderate set of long-lived inner UDP flows; high-churn UDP
+profiles are better served by `wlb`.
+
+**`wrtt` — weighted RTT scheduler:** each packet is sent on the path with the
+best weight-to-RTT score. When weights are equal, the lowest-RTT path leads.
+When weights differ, the higher-weight path dominates even if its RTT is worse.
+When the preferred path is congestion-limited, traffic spills over to secondary
+paths automatically (cwnd-block fallback). Path weights are set at runtime via
+`set_path_weight` (see [Client commands](#client-commands) below). Use `wrtt`
+when you need fine-grained per-link preference in addition to aggregation — for
+example, to prioritise a high-bandwidth fibre link over a metered LTE backup
+while still drawing on both under load.
+
+## systemd
+
+```bash
+# Server
+sudo cp /etc/mqvpn/server.conf.example /etc/mqvpn/server.conf
+sudo vi /etc/mqvpn/server.conf   # edit cert/key paths, auth key, etc.
+sudo systemctl enable --now mqvpn-server
+
+# Client (template — instance name maps to config file)
+sudo cp /etc/mqvpn/client.conf.example /etc/mqvpn/client-home.conf
+sudo vi /etc/mqvpn/client-home.conf   # edit server address, auth key, etc.
+sudo systemctl enable --now mqvpn-client@home
+```
+
+## Control API
+
+Both the server and the client can be managed at runtime over a TCP port using newline-delimited JSON.
+
+Control API: see [docs/control-api.md](docs/control-api.md) for the full wire-protocol reference (all 8 commands, request/response schemas, error strings).
+
+### Enable
+
+The control API is **disabled by default**. Enable it via any of the following:
+
+#### From `install.sh`
+
+```bash
+sudo bash install.sh --enable-control            # port 9090
+sudo bash install.sh --enable-control 9091
+```
+
+#### From INI (`/etc/mqvpn/server.conf`)
+
+```ini
+[Control]
+Listen = 127.0.0.1:9090
+```
+
+#### From JSON (`/etc/mqvpn/server.json`)
+
+```json
+{
+  "control_listen": "127.0.0.1:9090"
+}
+```
+
+#### From CLI (per-field override of the config file)
+
+```bash
+# Server — CLI
+sudo mqvpn --mode server ... --control-port 9090
+
+# Server — config file ([Control] section)
+# Port = 9090
+# Addr = 127.0.0.1
+
+# Client — CLI
+sudo mqvpn --mode client ... --control-port 9091
+
+# Client — config file ([Control] section)
+# Port = 9091
+# Addr = 127.0.0.1
+```
+
+> **Security:** bind only to `127.0.0.1` (the default) unless the port is protected by a firewall or network policy. The control API has no authentication.
+
+### Commands
+
+#### Add a user
+
+```bash
+echo '{"cmd":"add_user","name":"carol","key":"carol-secret"}' | nc 127.0.0.1 9090
+```
+```json
+{"ok":true}
+```
+
+Calling `add_user` with an existing name updates the key in place.
+
+To add a user with a fixed (pinned) IP that is permanently reserved for that user:
+
+```bash
+echo '{"cmd":"add_user","name":"carol","key":"carol-secret","fixed_ip":"10.0.0.50"}' | nc 127.0.0.1 9090
+```
+
+#### Set or clear a fixed IP for a user
+
+Assign a fixed IP to an existing user at runtime. The address is removed from the dynamic pool and reserved exclusively for that user from the next connection onward.
+
+```bash
+echo '{"cmd":"set_user_fixed_ip","name":"carol","fixed_ip":"10.0.0.50"}' | nc 127.0.0.1 9090
+```
+```json
+{"ok":true}
+```
+
+Pass `"fixed_ip":""` to remove the reservation and return the address to the dynamic pool:
+
+```bash
+echo '{"cmd":"set_user_fixed_ip","name":"carol","fixed_ip":""}' | nc 127.0.0.1 9090
+```
+
+#### Remove a user
+
+```bash
+echo '{"cmd":"remove_user","name":"carol"}' | nc 127.0.0.1 9090
+```
+```json
+{"ok":true}
+```
+
+#### List users
+
+```bash
+echo '{"cmd":"list_users"}' | nc 127.0.0.1 9090
+```
+```json
+{"ok":true,"users":["alice","bob"]}
+```
+
+#### Get stats
+
+```bash
+echo '{"cmd":"get_stats"}' | nc 127.0.0.1 9090
+```
+```json
+{"ok":true,"n_clients":2,"bytes_tx":983040,"bytes_rx":458752}
+```
+
+#### Error response
+
+```json
+{"ok":false,"error":"user not found"}
+```
+
+### Client commands
+
+#### Add a path
+
+```bash
+echo '{"cmd":"add_path","iface":"wlan0"}' | nc 127.0.0.1 9091
+```
+```json
+{"ok":true}
+```
+
+To add a backup (failover-only) path:
+
+```bash
+echo '{"cmd":"add_path","iface":"lte0","backup":true}' | nc 127.0.0.1 9091
+```
+
+#### Remove a path
+
+```bash
+echo '{"cmd":"remove_path","iface":"wlan0"}' | nc 127.0.0.1 9091
+```
+```json
+{"ok":true}
+```
+
+Removing the last remaining path is rejected with an error.
+
+#### List paths
+
+```bash
+echo '{"cmd":"list_paths"}' | nc 127.0.0.1 9091
+```
+```json
+{"ok":true,"paths":["eth0","wlan0"]}
+```
+
+#### Set path weight
+
+Set the scheduler weight for a path. Only effective with the `wrtt` scheduler.
+Higher weight directs more traffic to that path; when weights are equal, the
+lowest-RTT path is preferred. Weight `0` resets to the default (equivalent to
+`1`). Valid range: `0`–`65535`.
+
+```bash
+echo '{"cmd":"set_path_weight","iface":"eth0","weight":10}' | nc 127.0.0.1 9091
+```
+```json
+{"ok":true}
+```
+
+Example — prioritise `eth0` (fibre) over `wlan0` (WiFi) while keeping both active:
+
+```bash
+echo '{"cmd":"set_path_weight","iface":"eth0","weight":10}' | nc 127.0.0.1 9091
+echo '{"cmd":"set_path_weight","iface":"wlan0","weight":1}' | nc 127.0.0.1 9091
+```
+
+> **Note:** weights take effect once each path has completed its QUIC
+> PATH_CHALLENGE/RESPONSE handshake and reached the `active` state. Calling
+> `set_path_weight` before paths are active is accepted but the weight is applied
+> as soon as the path activates.
+
+### From code (Python example)
+
+```python
+import socket, json
+
+def ctrl(port, cmd):
+    with socket.create_connection(("127.0.0.1", port)) as s:
+        s.sendall((json.dumps(cmd) + "\n").encode())
+        return json.loads(s.makefile().readline())
+
+ctrl(9090, {"cmd": "add_user",          "name": "dave", "key": "dave-secret"})
+ctrl(9090, {"cmd": "add_user",          "name": "eve",  "key": "eve-secret", "fixed_ip": "10.0.0.50"})
+ctrl(9090, {"cmd": "set_user_fixed_ip", "name": "dave", "fixed_ip": "10.0.0.51"})
+ctrl(9090, {"cmd": "set_user_fixed_ip", "name": "dave", "fixed_ip": ""})  # clear
+ctrl(9090, {"cmd": "remove_user",       "name": "dave"})
+print(ctrl(9090, {"cmd": "list_users"}))   # {'ok': True, 'users': ['alice', 'bob', 'eve']}
+print(ctrl(9090, {"cmd": "get_stats"}))    # {'ok': True, 'n_clients': 1, ...}
+
+# WRTT weight control (client port)
+ctrl(9091, {"cmd": "set_path_weight", "iface": "eth0",  "weight": 10})
+ctrl(9091, {"cmd": "set_path_weight", "iface": "wlan0", "weight": 1})
+```
+
+## Benchmarks
+
+Asymmetric dual-path (300M/10ms + 80M/30ms) via network namespaces. Full report: [`docs/benchmarks_netns.md`](docs/benchmarks_netns.md)
+
+| Test | Result |
+|------|--------|
+| Failover | **0 downtime** |
+| Bandwidth aggregation (WLB, 16 streams) | **319 Mbps** (84% of 380 Mbps theoretical) |
+| WLB vs MinRTT | WLB **+21%** |
+
+## Architecture
+
+```
+┌─────────────────┐                          ┌─────────────────┐
+│   Application   │                          │    Internet     │
+├─────────────────┤                          ├─────────────────┤
+│   TUN (mqvpn0)  │                          │   TUN (mqvpn0)  │
+├─────────────────┤                          ├─────────────────┤
+│  MASQUE         │    HTTP Datagrams        │  MASQUE         │
+│  CONNECT-IP     │◄──(Context ID = 0)──────►│  CONNECT-IP     │
+├─────────────────┤                          ├─────────────────┤
+│  Multipath QUIC │◄── Path A ──────────────►│  Multipath QUIC │
+│                 │◄── Path B ──────────────►│                 │
+├─────────────────┤                          ├─────────────────┤
+│  UDP (eth0/wlan)│                          │   UDP (eth0)    │
+└─────────────────┘                          └─────────────────┘
+     Client                                      Server
+```
+
+## Building
+
+Requirements: Linux, CMake 3.10+, GCC/Clang (C11), libevent 2.x
+
+```bash
+git clone --recurse-submodules https://github.com/mp0rta/mqvpn.git
+cd mqvpn
+./build.sh            # builds BoringSSL, xquic, and mqvpn
+./build.sh --clean    # full rebuild
+```
+
+<details>
+<summary>Manual build steps</summary>
+
+```bash
+# 1. Build BoringSSL
+cd third_party/xquic/third_party/boringssl
+mkdir -p build && cd build
+cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+make -j$(nproc) ssl crypto
+cd ../../../../..
+
+# 2. Build xquic
+cd third_party/xquic
+mkdir -p build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+      -DSSL_PATH=../third_party/boringssl \
+      -DXQC_ENABLE_BBR2=ON \
+      -DXQC_ENABLE_FEC=ON \
+      -DXQC_ENABLE_XOR=ON ..
+make -j$(nproc)
+cd ../../..
+
+# 3. Build mqvpn
+mkdir -p build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release \
+      -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
+make -j$(nproc)
+```
+
+</details>
+
+### Android SDK
+
+```bash
+scripts/build_android.sh --abi arm64-v8a    # cross-compile C libs
+cd android && ./gradlew assembleDebug       # build SDK + demo app
+```
+
+<details>
+<summary>Module structure</summary>
+
+```
+android/
+├── sdk-native/    # JNI bridge → libmqvpn_jni.so
+├── sdk-runtime/   # MqvpnPoller (tick-loop)
+├── sdk-network/   # NetworkMonitor, PathBinder
+├── sdk-core/      # MqvpnVpnService, MqvpnManager, TunnelBridge
+└── app/           # Demo app (Jetpack Compose)
+```
+</details>
+
+## Testing
+
+```bash
+cd build && ctest --output-on-failure       # C library unit tests
+sudo scripts/ci_e2e/run_test.sh             # E2E (netns, requires root)
+sudo scripts/run_multipath_test.sh          # multipath failover
+cd android && ./gradlew test                # Android SDK unit tests
+```
+
+## Usage
+
+```
+mqvpn [--config PATH] --mode client|server [options]
+
+  --server IP:PORT       Server address (client)
+  --path IFACE           Multipath interface (repeatable)
+  --backup-path IFACE    Failover-only interface; used only when all primary paths are down (repeatable)
+  --auth-key KEY         PSK authentication
+  --user NAME:KEY        Add server user credential (repeatable)
+  --dns ADDR             DNS server (repeatable)
+  --insecure             Accept untrusted certs (testing only)
+    --cipher LIST          TLS cipher suites list (colon-separated)
+  --listen BIND:PORT     Listen address (server, default: 0.0.0.0:443)
+  --subnet CIDR          Client IPv4 pool (server)
+  --subnet6 CIDR         Client IPv6 pool (server)
+    --scheduler minrtt|wlb|backup|wlb_udp_pin|backup_fec|rap|wrtt Multipath scheduler (default: wlb)
+    --cc bbr2|bbr|cubic|new_reno|copa|unlimited Congestion control (default: bbr2)
+    --reinjection-control  Enable multipath reinjection control
+    --reinjection-mode default|deadline|dgram Reinjection control mode (default: default)
+    --fec-enable          Enable FEC
+    --no-fec              Disable FEC
+    --fec-scheme galois_calculation|packet_mask|reed_solomon|xor FEC scheme (default: reed_solomon)
+  --route-via-server     Add host route to server IP before setting default route (client)
+  --no-routes            Skip all automatic route setup; manage routes manually (client)
+  --control-port PORT    TCP port for JSON control API (server)
+  --control-addr ADDR    Bind address for control API (default: 127.0.0.1)
+  --genkey               Generate PSK and exit
+  --help                 Show all options
+```
+
+## Roadmap
+
+- [x] v0.1.0 — TLS verification, WLB scheduler, multi-client, PSK auth, DNS, config file
+- [x] v0.2.0 — Reconnection, kill switch, IPv6, ICMP PTB, systemd service
+- [x] v0.3.0 — libmqvpn (sans-I/O), Android Kotlin SDK, network detection
+- [x] Per-client token auth
+- [x] resolvectl DNS support (with resolv.conf fallback)
+- [x] v0.4.0 — Experimental backup_fec scheduler, Windows client, server control API support
+- [x] WRTT scheduler with per-path weight control
+- [ ] netlink API for routing (replace fork+exec of `ip` command)
+- [ ] Performance: GSO/GRO, sendmmsg, native Android I/O
+- [ ] Interop testing (masque-go, QUICHE)
+
+## Protocol Standards
+
+| Protocol | Spec |
+|----------|------|
+| MASQUE CONNECT-IP | [RFC 9484](https://www.rfc-editor.org/rfc/rfc9484) |
+| HTTP Datagrams | [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297) |
+| QUIC Datagrams | [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221) |
+| Multipath QUIC | [draft-ietf-quic-multipath](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/) |
+| HTTP/3 | [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114) |
+
+## Disclaimer
+
+mqvpn is licensed under the Apache License 2.0 and is provided **"AS IS"**, without warranties or conditions of any kind.
+
+Use of mqvpn is at your own risk. Users are solely responsible for validating its suitability, security, and operational safety, especially in production or commercial environments.
+
+## License
+
+Apache-2.0
+
+Copyright (c) 2026 mp0rta
+
+## Acknowledgments
+
+- [XQUIC](https://github.com/alibaba/xquic) by Alibaba
+- IETF QUIC and MASQUE working groups

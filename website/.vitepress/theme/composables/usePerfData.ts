@@ -1,0 +1,273 @@
+import { ref, onMounted, computed, type Ref } from 'vue'
+
+// ── Format helpers ──
+
+export function fmtDate(ts: string) {
+  return new Date(ts).toISOString().slice(0, 10)
+}
+
+export function fmtCommit(c: string) {
+  return c ? c.slice(0, 7) : '?'
+}
+
+export function fmtNum(v: number | null | undefined, digits = 1) {
+  if (v == null) return '-'
+  return Number(v).toFixed(digits)
+}
+
+// ── Data types ──
+
+export interface IndexEntry {
+  commit: string
+  timestamp: string
+  type: string
+  files: string[]
+}
+
+export interface BenchmarkItem {
+  commit: string
+  timestamp: string
+  data: any
+}
+
+// ── Fetch helpers ──
+
+async function fetchJson(url: string) {
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`${url}: ${res.status}`)
+  return res.json()
+}
+
+// PERF_DATA_BASE includes the bucket prefix `perf-data/` so subPath '' reaches
+// the per-commit index. The R2 custom domain is bound to bucket root, hence the
+// duplicated "perf-data" segment (subdomain + prefix) in the URL.
+const PERF_DATA_BASE = (import.meta as any).env?.VITE_PERF_DATA_BASE
+  ?? 'https://perf-data.mqvpn.org/perf-data'
+
+/**
+ * Fetch benchmark data from R2.
+ * @param subPath - '' for per-commit, '/weekly' for weekly
+ * @param maxEntries - how many index entries to load (default 10)
+ */
+export function usePerfData(subPath: string, maxEntries = 10) {
+  const basePath = `${PERF_DATA_BASE}${subPath}`
+  const loading = ref(true)
+  const error = ref('')
+  const items: Ref<BenchmarkItem[]> = ref([])
+
+  onMounted(async () => {
+    try {
+      const index: IndexEntry[] = await fetchJson(`${basePath}/index.json`)
+      const entries = index.slice(0, maxEntries)
+
+      const tasks = entries.flatMap(entry =>
+        (entry.files || []).map(async file => ({
+          commit: entry.commit,
+          timestamp: entry.timestamp,
+          data: await fetchJson(`${basePath}/${file}`),
+        }))
+      )
+      items.value = await Promise.all(tasks)
+    } catch (e: any) {
+      error.value = e.message || 'Failed to load benchmark data.'
+    } finally {
+      loading.value = false
+    }
+  })
+
+  // ── Computed row extractors ──
+
+  const rawRows = computed(() => {
+    const rows: any[] = []
+    for (const item of items.value) {
+      if (item.data.test !== 'raw_throughput') continue
+      for (const dir of Object.keys(item.data.results || {})) {
+        const r = item.data.results[dir]
+        rows.push({
+          commit: fmtCommit(item.commit),
+          date: fmtDate(item.timestamp),
+          dir,
+          single: fmtNum(r.single_path_mbps),
+          minrtt: fmtNum(r.multipath_minrtt_mbps),
+          wlb: fmtNum(r.multipath_wlb_mbps),
+        })
+      }
+    }
+    return rows
+  })
+
+  const failoverRows = computed(() => {
+    const rows: any[] = []
+    for (const item of items.value) {
+      if (item.data.test !== 'failover') continue
+      for (const sched of ['wlb', 'minrtt']) {
+        const r = item.data.results?.[sched] || {}
+        // New format: fault_a / fault_b sub-objects
+        if (r.fault_a) {
+          for (const fp of ['fault_a', 'fault_b']) {
+            const d = r[fp] || {}
+            rows.push({
+              commit: fmtCommit(item.commit),
+              date: fmtDate(item.timestamp),
+              scheduler: sched,
+              fault_path: fp === 'fault_a' ? 'A' : 'B',
+              ttf: fmtNum(d.ttf_sec, 2),
+              ttr: fmtNum(d.ttr_sec, 2),
+              pre: fmtNum(d.pre_fault_avg_mbps),
+              degraded: fmtNum(d.degraded_avg_mbps),
+              recovery: fmtNum(d.recovery_avg_mbps),
+              post: fmtNum(r.post_recover_avg_mbps),
+            })
+          }
+        } else {
+          // Old format: flat (backward compat for existing data)
+          rows.push({
+            commit: fmtCommit(item.commit),
+            date: fmtDate(item.timestamp),
+            scheduler: sched,
+            fault_path: 'A',
+            ttf: fmtNum(r.ttf_sec, 2),
+            ttr: fmtNum(r.ttr_sec, 2),
+            pre: fmtNum(r.pre_fault_avg_mbps),
+            degraded: fmtNum(r.degraded_avg_mbps),
+            recovery: '-',
+            post: fmtNum(r.post_recover_avg_mbps),
+          })
+        }
+      }
+    }
+    return rows
+  })
+
+  const aggregateRows = computed(() => {
+    const rows: any[] = []
+    for (const item of items.value) {
+      if (item.data.test !== 'aggregate') continue
+      for (const sched of Object.keys(item.data.results || {})) {
+        const arr = item.data.results[sched]
+        if (!Array.isArray(arr)) continue
+        for (const r of arr) {
+          rows.push({
+            commit: fmtCommit(item.commit),
+            date: fmtDate(item.timestamp),
+            scheduler: sched,
+            streams: r.streams,
+            single: fmtNum(r.single_path_mbps),
+            multi: fmtNum(r.multipath_mbps),
+            gain: fmtNum(r.gain_pct) + '%',
+          })
+        }
+      }
+    }
+    return rows
+  })
+
+  // ── Weekly-only extractors ──
+
+  const multipathSchedulerRows = computed(() => {
+    const rows: any[] = []
+    for (const item of items.value) {
+      if (item.data.test !== 'multipath_scheduler') continue
+      for (const s of item.data.scenarios || []) {
+        rows.push({
+          commit: fmtCommit(item.commit),
+          date: fmtDate(item.timestamp),
+          scenario: s.name,
+          netem_a: s.netem_a,
+          netem_b: s.netem_b,
+          single: fmtNum(s.single_mbps),
+          wlb: fmtNum(s.wlb_mbps),
+          minrtt: fmtNum(s.minrtt_mbps),
+        })
+      }
+    }
+    return rows
+  })
+
+  const udpSweepSummaryRows = computed(() => {
+    const rows: any[] = []
+    for (const item of items.value) {
+      if (item.data.test !== 'udp_sweep') continue
+      const r = item.data.results || {}
+      rows.push({
+        commit: fmtCommit(item.commit),
+        date: fmtDate(item.timestamp),
+        single_saturation: r.single?.saturation_mbps != null ? fmtNum(r.single.saturation_mbps, 0) : '-',
+        wlb_saturation: r.wlb?.saturation_mbps != null ? fmtNum(r.wlb.saturation_mbps, 0) : '-',
+        minrtt_saturation: r.minrtt?.saturation_mbps != null ? fmtNum(r.minrtt.saturation_mbps, 0) : '-',
+      })
+    }
+    return rows
+  })
+
+  const udpSweepRows = computed(() => {
+    const rows: any[] = []
+    for (const item of items.value) {
+      if (item.data.test !== 'udp_sweep') continue
+      for (const sched of ['single', 'wlb', 'minrtt']) {
+        const pts = item.data.results?.[sched]?.points || []
+        for (const p of pts) {
+          rows.push({
+            commit: fmtCommit(item.commit),
+            date: fmtDate(item.timestamp),
+            scheduler: sched,
+            rate: p.rate,
+            throughput: fmtNum(p.throughput),
+            loss: fmtNum(p.loss_pct, 2),
+            jitter: fmtNum(p.jitter_ms, 3),
+          })
+        }
+      }
+    }
+    return rows
+  })
+
+  const ntnRows = computed(() => {
+    const rows: any[] = []
+    for (const item of items.value) {
+      if (item.data.test !== 'ntn') continue
+      for (const s of item.data.scenarios || []) {
+        rows.push({
+          commit: fmtCommit(item.commit),
+          date: fmtDate(item.timestamp),
+          scenario: s.name || s.description,
+          single: fmtNum(s.single_mbps),
+          wlb: fmtNum(s.wlb_mbps),
+          minrtt: fmtNum(s.minrtt_mbps),
+        })
+      }
+    }
+    return rows
+  })
+
+  const backupFecRows = computed(() => {
+    const rows: any[] = []
+    for (const item of items.value) {
+      if (item.data.test !== 'backup_fec') continue
+      for (const r of item.data.results || []) {
+        rows.push({
+          commit: fmtCommit(item.commit),
+          date: fmtDate(item.timestamp),
+          scheduler: r.scheduler,
+          loss_pct: r.loss_pct,
+          throughput_mbps: fmtNum(r.throughput_mbps_median),
+        })
+      }
+    }
+    return rows
+  })
+
+  return {
+    loading,
+    error,
+    items,
+    rawRows,
+    failoverRows,
+    aggregateRows,
+    multipathSchedulerRows,
+    udpSweepSummaryRows,
+    udpSweepRows,
+    ntnRows,
+    backupFecRows,
+  }
+}

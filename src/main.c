@@ -1,0 +1,738 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqvpn contributors
+
+#include "libmqvpn.h"
+#include "log.h"
+#include "config.h"
+#include "json_mini.h"
+#include "auth.h"
+#include "vpn_client.h"
+#include "vpn_server.h"
+#include "flow_sched.h"
+
+#include <xquic/xquic.h> /* for XQC_ENABLE_* compile-time defines */
+
+#ifdef _WIN32
+#  include "platform_windows.h"
+#  include <winsock2.h>
+#else
+#  include "platform_linux.h"
+#  include "status.h"
+#endif
+
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <getopt.h>
+
+#ifndef MQVPN_GIT_COMMIT
+#  define MQVPN_GIT_COMMIT "unknown"
+#endif
+
+static void
+usage(const char *prog)
+{
+    fprintf(stderr, "mqvpn (commit %s)\n\n", MQVPN_GIT_COMMIT);
+    fprintf(
+        stderr,
+        "Usage:\n"
+        "  sudo %s --config <path>                  (mode from config)\n"
+        "  sudo %s --mode client --server <host:port> [options]\n"
+        "  sudo %s --mode server --listen <bind:port> [options]\n"
+        "\n"
+        "Options:\n"
+        "  --config PATH             Configuration file (INI or JSON format)\n"
+        "  --mode client|server      Operating mode (required if no config)\n"
+        "  --server HOST:PORT        Server address (client mode, [IPv6]:PORT for IPv6)\n"
+        "  --listen BIND:PORT        Listen address (server mode, default 0.0.0.0:443)\n"
+        "  --subnet CIDR             Client IP pool (server mode, default 10.0.0.0/24)\n"
+        "  --subnet6 CIDR            IPv6 client IP pool (server mode, e.g. "
+        "fd00:abcd::/112)\n"
+        "  --tun-name NAME           TUN device name (default mqvpn0)\n"
+        "  --cert PATH               TLS certificate (server mode)\n"
+        "  --key PATH                TLS private key (server mode)\n"
+        "  --cipher LIST             TLS cipher suites list (colon-separated)\n"
+        "  --tls-server-name NAME    TLS SNI / cert verify name (client mode)\n"
+        "  --insecure                Accept untrusted certs (client mode, testing only)\n"
+        "  --auth-key KEY            PSK for authentication\n"
+        "  --user NAME:KEY           Add a server user credential (repeatable)\n"
+        "  --genkey                  Generate a random PSK and exit\n"
+        "  --path IFACE              Network interface for multipath (repeatable, client "
+        "mode)\n"
+        "  --dns ADDR                DNS server to use (repeatable, client mode, max 4)\n"
+        "  --no-reconnect            Disable automatic reconnection (client mode)\n"
+        "  --kill-switch             Block traffic outside the VPN tunnel (client mode)\n"
+        "  --route-via-server        Add a host route to the server IP before setting\n"
+        "  --routeviaserver         Alias for --route-via-server\n"
+        "  --routesviaserver        Alias for --route-via-server\n"
+        "                            the default route through the tunnel (client mode)\n"
+        "  --no-routes               Skip all automatic route setup; manage routes\n"
+        "  --noroutes               Alias for --no-routes\n"
+        "                            manually (client mode)\n"
+        "  --control-port PORT       TCP port for JSON control API (server mode)\n"
+        "  --control-addr ADDR       Bind address for control API (default 127.0.0.1)\n"
+        "                            (also configurable via [Control] Listen in INI / "
+        "control_listen in JSON)\n"
+        "  --status                  Query server status via control API and exit\n"
+        "                            (uses --control-port, or [Control] Listen from "
+        "--config)\n"
+        "  --scheduler minrtt|wlb|backup|wlb_udp_pin|backup_fec|rap  Multipath scheduler (default wlb)\n"
+        "  --init-max-path-id N      MP-QUIC draft-21 test knob: initial path-id "
+        "credit\n"
+        "                            TP (default = xquic default 8; set lower, "
+        "e.g. 2,\n"
+        "                            to exercise G-P16 PATHS_BLOCKED).\n"
+        "  --reinjection-control     Enable multipath reinjection control\n"
+        "  --reinjection-mode default|deadline|dgram  Reinjection control mode\n"
+        "  --fec-enable              Enable FEC\n"
+        "  --no-fec                  Disable FEC\n"
+        "  --fec-scheme galois_calculation|packet_mask|reed_solomon|xor  FEC scheme\n"
+        "  --cc bbr2|bbr|cubic|new_reno|copa|unlimited|none  Congestion control (default bbr2)\n"
+        "  --mtu N                   TUN MTU, 1280-9000 (client: cap on negotiated;\n"
+        "                            server: sets TUN MTU; default: auto = ~1382)\n"
+        "  --max-clients N           Max concurrent clients (server mode, default 64)\n"
+        "  --log-level debug|info|warn|error  (default info)\n"
+        "  --version                 Show version and exit\n"
+        "  --help                    Show this help\n"
+        "\n"
+        "CLI options override config file values.\n",
+        prog, prog, prog);
+}
+
+static int
+parse_host_port(const char *str, char *host, size_t host_len, int *port)
+{
+    if (str[0] == '[') {
+        /* Bracket notation for IPv6: [host]:port */
+        const char *close = strchr(str, ']');
+        if (!close || close[1] != ':') {
+            fprintf(stderr, "error: expected [HOST]:PORT, got '%s'\n", str);
+            return -1;
+        }
+        size_t hlen = (size_t)(close - str - 1);
+        if (hlen >= host_len) hlen = host_len - 1;
+        memcpy(host, str + 1, hlen);
+        host[hlen] = '\0';
+        *port = atoi(close + 2);
+    } else {
+        /* Legacy: host:port (last colon) */
+        const char *colon = strrchr(str, ':');
+        if (!colon) {
+            fprintf(stderr, "error: expected HOST:PORT, got '%s'\n", str);
+            return -1;
+        }
+        size_t hlen = (size_t)(colon - str);
+        if (hlen >= host_len) hlen = host_len - 1;
+        memcpy(host, str, hlen);
+        host[hlen] = '\0';
+        *port = atoi(colon + 1);
+    }
+    if (*port <= 0 || *port > 65535) {
+        fprintf(stderr, "error: invalid port in '%s'\n", str);
+        return -1;
+    }
+    return 0;
+}
+
+/* mqvpn_copy_str is provided by json_mini.h as mqvpn_copy_str */
+
+int
+main(int argc, char *argv[])
+{
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "error: WSAStartup failed\n");
+        return 1;
+    }
+#endif
+
+    static struct option long_opts[] = {
+        {"config", required_argument, NULL, 'C'},
+        {"mode", required_argument, NULL, 'm'},
+        {"server", required_argument, NULL, 's'},
+        {"listen", required_argument, NULL, 'l'},
+        {"subnet", required_argument, NULL, 'n'},
+        {"subnet6", required_argument, NULL, '6'},
+        {"tun-name", required_argument, NULL, 't'},
+        {"cert", required_argument, NULL, 'c'},
+        {"key", required_argument, NULL, 'k'},
+        {"cipher", required_argument, NULL, 'y'},
+        {"insecure", no_argument, NULL, 'i'},
+        {"auth-key", required_argument, NULL, 'a'},
+        {"user", required_argument, NULL, 'u'},
+        {"genkey", no_argument, NULL, 'G'},
+        {"path", required_argument, NULL, 'p'},
+        {"backup-path", required_argument, NULL, 'b'},
+        {"dns", required_argument, NULL, 'd'},
+        {"scheduler", required_argument, NULL, 'S'},
+        {"cc", required_argument, NULL, 0x101},
+        {"init-max-path-id", required_argument, NULL, 0x100},
+        {"mtu", required_argument, NULL, 0x102},
+        {"reinjection-control", no_argument, NULL, 'Y'},
+        {"reinjection-mode", required_argument, NULL, 'Z'},
+        {"fec-enable", no_argument, NULL, 'E'},
+        {"no-fec", no_argument, NULL, 'e'},
+        {"fec-scheme", required_argument, NULL, 'F'},
+        {"max-clients", required_argument, NULL, 'M'},
+        {"log-level", required_argument, NULL, 'L'},
+        {"no-reconnect", no_argument, NULL, 'R'},
+        {"kill-switch", no_argument, NULL, 'K'},
+        {"route-via-server", no_argument, NULL, 'w'},
+        {"routeviaserver", no_argument, NULL, 'w'},
+        {"routesviaserver", no_argument, NULL, 'w'},
+        {"no-routes", no_argument, NULL, 'W'},
+        {"noroutes", no_argument, NULL, 'W'},
+        {"tls-server-name", required_argument, NULL, 0x104},
+        {"control-port", required_argument, NULL, 'X'},
+        {"control-addr", required_argument, NULL, 'x'},
+        {"status", no_argument, NULL, 'T'},
+        {"version", no_argument, NULL, 'V'},
+        {"help", no_argument, NULL, 'h'},
+        {NULL, 0, NULL, 0},
+    };
+
+    const char *config_path = NULL;
+    const char *mode = NULL;
+    const char *server_str = NULL;
+    const char *listen_str = NULL; /* NULL means "not set by CLI" */
+    const char *subnet = NULL;
+    const char *subnet6 = NULL;
+    const char *tun_name = NULL;
+    const char *cert_file = NULL;
+    const char *key_file = NULL;
+    const char *cipher_list = NULL;
+    int insecure = -1; /* -1 means "not set by CLI" */
+    const char *tls_server_name = NULL;
+    const char *auth_key = NULL;
+    char cli_user_names[MQVPN_CONFIG_MAX_USERS][64];
+    char cli_user_keys[MQVPN_CONFIG_MAX_USERS][256];
+    int n_cli_users = 0;
+    int genkey = 0;
+    const char *log_level_str = NULL;
+    const char *scheduler_str = NULL;
+    const char *cc_str = NULL;
+    uint64_t init_max_path_id = 0; /* 0 = unset → xquic default (8) */
+    int init_max_path_id_set = 0;
+    int cli_mtu = -1;     /* -1 means "not set by CLI" */
+    int reinjection_control = -1; /* -1 means not set by CLI */
+    const char *reinjection_mode_str = NULL;
+    int fec_enable = -1; /* -1 means not set by CLI */
+    const char *fec_scheme_str = NULL;
+    int max_clients = -1; /* -1 means "not set by CLI" */
+    const char *path_ifaces[MQVPN_MAX_PATH_IFACES];
+    int n_paths = 0;
+    const char *backup_ifaces[MQVPN_MAX_PATH_IFACES];
+    int n_backup_paths = 0;
+    const char *dns_servers[4];
+    int n_dns = 0;
+    int no_reconnect = 0;
+    int kill_switch = -1;        /* -1 = not set by CLI */
+    int route_via_server = -1;   /* -1 = not set by CLI */
+    int no_routes = -1;          /* -1 = not set by CLI */
+    int control_port = 0;
+    int control_port_set = 0; /* 1 iff --control-port was passed explicitly */
+    const char *control_addr = NULL;
+    int status_mode = 0;
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "C:m:s:l:n:6:t:c:k:y:ia:u:Gp:b:d:S:YZ:EeF:Q:M:L:X:x:wWRKTVh",
+                              long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'C': config_path = optarg; break;
+        case 'm': mode = optarg; break;
+        case 's': server_str = optarg; break;
+        case 'l': listen_str = optarg; break;
+        case 'n': subnet = optarg; break;
+        case '6': subnet6 = optarg; break;
+        case 't': tun_name = optarg; break;
+        case 'c': cert_file = optarg; break;
+        case 'k': key_file = optarg; break;
+        case 'y': cipher_list = optarg; break;
+        case 'i': insecure = 1; break;
+        case 'a': auth_key = optarg; break;
+        case 'u': {
+            if (n_cli_users >= MQVPN_CONFIG_MAX_USERS) {
+                fprintf(stderr, "error: max %d users supported\n",
+                        MQVPN_CONFIG_MAX_USERS);
+                return 1;
+            }
+            char pair[360];
+            snprintf(pair, sizeof(pair), "%s", optarg);
+            char *sep = strchr(pair, ':');
+            if (!sep) {
+                fprintf(stderr, "error: --user must be NAME:KEY\n");
+                return 1;
+            }
+            *sep = '\0';
+            mqvpn_copy_str(cli_user_names[n_cli_users],
+                           sizeof(cli_user_names[n_cli_users]), pair);
+            mqvpn_copy_str(cli_user_keys[n_cli_users], sizeof(cli_user_keys[n_cli_users]),
+                           sep + 1);
+            if (cli_user_names[n_cli_users][0] == '\0' ||
+                cli_user_keys[n_cli_users][0] == '\0') {
+                fprintf(stderr, "error: --user must be NAME:KEY\n");
+                return 1;
+            }
+            n_cli_users++;
+            break;
+        }
+        case 'G': genkey = 1; break;
+        case 'p':
+            if (n_paths < MQVPN_MAX_PATH_IFACES) {
+                path_ifaces[n_paths++] = optarg;
+            } else {
+                fprintf(stderr, "error: max %d paths supported\n", MQVPN_MAX_PATH_IFACES);
+                return 1;
+            }
+            break;
+        case 'b':
+            if (n_backup_paths < MQVPN_MAX_PATH_IFACES) {
+                backup_ifaces[n_backup_paths++] = optarg;
+            } else {
+                fprintf(stderr, "error: max %d backup paths supported\n", MQVPN_MAX_PATH_IFACES);
+                return 1;
+            }
+            break;
+        case 'd':
+            if (n_dns < 4) {
+                dns_servers[n_dns++] = optarg;
+            } else {
+                fprintf(stderr, "error: max 4 DNS servers supported\n");
+                return 1;
+            }
+            break;
+        case 'S': scheduler_str = optarg; break;
+        case 0x101: cc_str = optarg; break;
+        case 0x100: {
+            /* Reject leading '-' explicitly: strtoull silently wraps "-1" to
+             * UINT64_MAX rather than failing. */
+            if (optarg[0] == '-' || optarg[0] == '\0') {
+                fprintf(stderr, "error: --init-max-path-id must be 0..4294967295\n");
+                return 1;
+            }
+            char *end = NULL;
+            errno = 0;
+            unsigned long long v = strtoull(optarg, &end, 10);
+            if (!end || *end != '\0' || errno == ERANGE ||
+                v > MQVPN_INIT_MAX_PATH_ID_MAX) {
+                fprintf(stderr, "error: --init-max-path-id must be 0..4294967295\n");
+                return 1;
+            }
+            init_max_path_id = (uint64_t)v;
+            init_max_path_id_set = 1;
+            break;
+        }
+        case 'Y': reinjection_control = 1; break;
+        case 'Z': reinjection_mode_str = optarg; break;
+        case 'E': fec_enable = 1; break;
+        case 'e': fec_enable = 0; break;
+        case 'F': fec_scheme_str = optarg; break;
+        case 0x102: {
+            char *end = NULL;
+            errno = 0;
+            long lv = strtol(optarg, &end, 10);
+            if (end == optarg || !end || *end != '\0' || errno == ERANGE ||
+                lv < INT_MIN || lv > INT_MAX) {
+                fprintf(stderr, "error: --mtu must be 0 or 1280..9000\n");
+                return 1;
+            }
+            int v = (int)lv;
+            if (v != 0 && (v < 1280 || v > 9000)) {
+                fprintf(stderr, "error: --mtu must be 0 or 1280..9000\n");
+                return 1;
+            }
+            cli_mtu = v;
+            break;
+        }
+        case 'M': max_clients = atoi(optarg); break;
+        case 'R': no_reconnect = 1; break;
+        case 'K': kill_switch = 1; break;
+        case 'w': route_via_server = 1; break;
+        case 'W': no_routes = 1; break;
+        case 0x104: tls_server_name = optarg; break;
+        case 'X':
+            control_port = atoi(optarg);
+            control_port_set = 1;
+            break;
+        case 'x': control_addr = optarg; break;
+        case 'T': status_mode = 1; break;
+        case 'L': log_level_str = optarg; break;
+        case 'V': printf("mqvpn %s\n", mqvpn_version_string()); return 0;
+        case 'h': usage(argv[0]); return 0;
+        default: usage(argv[0]); return 1;
+        }
+    }
+
+    /* --genkey: generate PSK and exit */
+    if (genkey) {
+        return mqvpn_auth_genkey() < 0 ? 1 : 0;
+    }
+
+    /* Load config file (if given), then apply CLI overrides.
+     * Hoisted above --status so [Control] Listen in the INI/JSON config
+     * can satisfy --status without requiring --control-port on the CLI. */
+    mqvpn_file_config_t file_cfg;
+    mqvpn_config_defaults(&file_cfg);
+
+    if (config_path) {
+        if (mqvpn_config_load(&file_cfg, config_path) < 0) {
+            return 1;
+        }
+    }
+
+    /* Resolve effective control endpoint (INI base + per-field CLI overrides).
+     * Used by both --status (below) and the server-mode listener (further down). */
+    char eff_control_addr_buf[256] = {0};
+    const char *eff_control_addr = NULL;
+    int eff_control_port = 0;
+    if (mqvpn_resolve_control_endpoint(file_cfg.control_listen, control_addr,
+                                       control_port, control_port_set,
+                                       eff_control_addr_buf, sizeof(eff_control_addr_buf),
+                                       &eff_control_addr, &eff_control_port) < 0) {
+        fprintf(stderr, "error: invalid [Control] Listen = '%s'\n",
+                file_cfg.control_listen);
+        return 1;
+    }
+    /* --control-addr without a port is a silent-disable trap: warn so admins
+     * notice the missing --control-port / [Control] Listen. */
+    if (eff_control_addr != NULL && eff_control_port == 0) {
+        LOG_WRN("--control-addr ignored: no port configured (use --control-port "
+                "or [Control] Listen)");
+    }
+
+#ifndef _WIN32
+    /* --status: query control API and exit */
+    if (status_mode) {
+        if (eff_control_port <= 0) {
+            fprintf(stderr, "error: --status requires --control-port or "
+                            "[Control] Listen in config\n");
+            return 1;
+        }
+        return run_status(eff_control_addr, eff_control_port);
+    }
+#endif
+
+    /* CLI overrides config file values */
+    const char *eff_tun_name = tun_name ? tun_name : file_cfg.tun_name;
+    const char *eff_log_level = log_level_str ? log_level_str : file_cfg.log_level;
+    const char *eff_scheduler = scheduler_str ? scheduler_str : file_cfg.scheduler;
+    const char *eff_cc = cc_str ? cc_str : file_cfg.cc;
+    uint64_t eff_init_max_path_id =
+        init_max_path_id_set ? init_max_path_id : (uint64_t)file_cfg.init_max_path_id;
+    int eff_reinjection_control = reinjection_control >= 0
+                                  ? reinjection_control
+                                  : file_cfg.reinjection_control;
+    const char *eff_reinjection_mode = reinjection_mode_str
+                                       ? reinjection_mode_str
+                                       : file_cfg.reinjection_mode;
+    int eff_fec_enable = fec_enable >= 0 ? fec_enable : file_cfg.fec_enable;
+    const char *eff_fec_scheme = fec_scheme_str ? fec_scheme_str : file_cfg.fec_scheme;
+    const char *eff_listen = listen_str ? listen_str : file_cfg.listen;
+    const char *eff_subnet = subnet ? subnet : file_cfg.subnet;
+    const char *eff_subnet6 =
+        subnet6 ? subnet6 : (file_cfg.subnet6[0] ? file_cfg.subnet6 : NULL);
+    const char *eff_cert = cert_file ? cert_file : file_cfg.cert_file;
+    const char *eff_key = key_file ? key_file : file_cfg.key_file;
+    const char *eff_tls_ciphers = cipher_list ? cipher_list : file_cfg.tls_ciphers;
+    int eff_insecure = insecure >= 0 ? insecure : file_cfg.insecure;
+    int eff_max_clients = max_clients >= 0 ? max_clients : file_cfg.max_clients;
+    int eff_tun_mtu = cli_mtu >= 0 ? cli_mtu : file_cfg.tun_mtu;
+
+    /* Auth key: CLI > config (use auth_key for client, server_auth_key for server) */
+    const char *eff_auth_key =
+        auth_key ? auth_key
+                 : (file_cfg.server_auth_key[0]
+                        ? file_cfg.server_auth_key
+                        : (file_cfg.auth_key[0] ? file_cfg.auth_key : NULL));
+
+    const char *eff_user_names[MQVPN_CONFIG_MAX_USERS];
+    const char *eff_user_keys[MQVPN_CONFIG_MAX_USERS];
+    const char *eff_user_fixed_ips[MQVPN_CONFIG_MAX_USERS];
+    int eff_n_users = 0;
+    if (n_cli_users > 0) {
+        eff_n_users = n_cli_users;
+        for (int i = 0; i < eff_n_users; i++) {
+            eff_user_names[i] = cli_user_names[i];
+            eff_user_keys[i] = cli_user_keys[i];
+            eff_user_fixed_ips[i] = NULL; /* CLI users have no fixed IP */
+        }
+    } else if (file_cfg.n_users > 0) {
+        eff_n_users = file_cfg.n_users;
+        for (int i = 0; i < eff_n_users; i++) {
+            eff_user_names[i] = file_cfg.user_names[i];
+            eff_user_keys[i] = file_cfg.user_keys[i];
+            eff_user_fixed_ips[i] = file_cfg.user_fixed_ips[i][0]
+                                        ? file_cfg.user_fixed_ips[i] : NULL;
+        }
+    }
+
+    /* Determine mode: CLI > config file > error */
+    const char *eff_mode = mode;
+    if (!eff_mode) {
+        if (config_path) {
+            eff_mode = file_cfg.is_server ? "server" : "client";
+            /* Client mode needs server address */
+            if (!file_cfg.is_server && file_cfg.server_addr[0] == '\0') {
+                fprintf(
+                    stderr,
+                    "error: config has no [Server] Address and no --mode specified\n");
+                usage(argv[0]);
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "error: --mode is required\n");
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    /* Server address: CLI > config */
+    const char *eff_server = server_str ? server_str : file_cfg.server_addr;
+
+    /* Set log level */
+    mqvpn_log_level_t log_level = MQVPN_LOG_INFO;
+    if (strcmp(eff_log_level, "debug") == 0)
+        log_level = MQVPN_LOG_DEBUG;
+    else if (strcmp(eff_log_level, "info") == 0)
+        log_level = MQVPN_LOG_INFO;
+    else if (strcmp(eff_log_level, "warn") == 0)
+        log_level = MQVPN_LOG_WARN;
+    else if (strcmp(eff_log_level, "error") == 0)
+        log_level = MQVPN_LOG_ERROR;
+    mqvpn_log_set_level(log_level);
+
+    /* Parse scheduler */
+    int scheduler = MQVPN_SCHED_MINRTT;
+    if (strcmp(eff_scheduler, "wlb") == 0) {
+        scheduler = MQVPN_SCHED_WLB;
+    } else if (strcmp(eff_scheduler, "backup") == 0) {
+        scheduler = MQVPN_SCHED_BACKUP;
+    } else if (strcmp(eff_scheduler, "wlb_udp_pin") == 0) {
+        scheduler = MQVPN_SCHED_WLB_UDP_PIN;
+    } else if (strcmp(eff_scheduler, "backup_fec") == 0) {
+        scheduler = MQVPN_SCHED_BACKUP_FEC;
+    } else if (strcmp(eff_scheduler, "rap") == 0) {
+        scheduler = MQVPN_SCHED_RAP;
+    } else if (strcmp(eff_scheduler, "wrtt") == 0) {
+        scheduler = MQVPN_SCHED_WRTT;
+    } else if (strcmp(eff_scheduler, "minrtt") != 0) {
+        fprintf(stderr, "error: --scheduler must be 'minrtt', 'wlb', 'backup', 'wlb_udp_pin', 'backup_fec', 'rap' or 'wrtt'\n");
+        return 1;
+    }
+
+    /* Parse congestion control */
+    int cc = MQVPN_CC_BBR2;
+    if (strcmp(eff_cc, "bbr") == 0) {
+        cc = MQVPN_CC_BBR;
+    } else if (strcmp(eff_cc, "cubic") == 0) {
+        cc = MQVPN_CC_CUBIC;
+    } else if (strcmp(eff_cc, "new_reno") == 0) {
+        cc = MQVPN_CC_NEW_RENO;
+    } else if (strcmp(eff_cc, "copa") == 0) {
+        cc = MQVPN_CC_COPA;
+    } else if (strcmp(eff_cc, "unlimited") == 0) {
+        cc = MQVPN_CC_UNLIMITED;
+    } else if (strcmp(eff_cc, "none") == 0) {
+#ifdef XQC_ENABLE_UNLIMITED
+        cc = MQVPN_CC_NONE;
+#else
+        fprintf(stderr, "error: --cc 'none' requires rebuild with "
+                        "-DXQC_ENABLE_UNLIMITED=ON in xquic\n");
+        return 1;
+#endif
+    } else if (strcmp(eff_cc, "bbr2") != 0) {
+        fprintf(stderr, "error: --cc must be 'bbr2', 'bbr', 'cubic', 'new_reno', 'copa', 'unlimited', or 'none'\n");
+        return 1;
+    }
+
+    int reinjection_mode = MQVPN_REINJ_CTL_DEFAULT;
+    if (strcmp(eff_reinjection_mode, "deadline") == 0) {
+        reinjection_mode = MQVPN_REINJ_CTL_DEADLINE;
+    } else if (strcmp(eff_reinjection_mode, "dgram") == 0) {
+        reinjection_mode = MQVPN_REINJ_CTL_DGRAM;
+    } else if (strcmp(eff_reinjection_mode, "default") != 0) {
+        fprintf(stderr,
+                "error: --reinjection-mode must be 'default', 'deadline' or 'dgram'\n");
+        return 1;
+    }
+
+    int fec_scheme = MQVPN_FEC_SCHEME_REED_SOLOMON;
+    if (strcmp(eff_fec_scheme, "xor") == 0) {
+        fec_scheme = MQVPN_FEC_SCHEME_XOR;
+    } else if (strcmp(eff_fec_scheme, "packet_mask") == 0 ||
+               strcmp(eff_fec_scheme, "packet_maskn") == 0) {
+        fec_scheme = MQVPN_FEC_SCHEME_PACKET_MASK;
+    } else if (strcmp(eff_fec_scheme, "galois_calculation") == 0) {
+        fec_scheme = MQVPN_FEC_SCHEME_GALOIS_CALCULATION;
+    } else if (strcmp(eff_fec_scheme, "reed_solomon") != 0) {
+        fprintf(stderr,
+                "error: --fec-scheme must be 'galois_calculation', 'packet_mask', 'reed_solomon' or 'xor'\n");
+        return 1;
+    }
+
+    /* Paths: CLI paths override config paths entirely */
+    if (n_paths == 0 && file_cfg.n_paths > 0) {
+        n_paths = file_cfg.n_paths;
+        for (int i = 0; i < n_paths; i++) {
+            path_ifaces[i] = file_cfg.paths[i];
+        }
+    }
+
+    /* Backup paths: CLI backup paths override config backup paths entirely */
+    if (n_backup_paths == 0 && file_cfg.n_backup_paths > 0) {
+        n_backup_paths = file_cfg.n_backup_paths;
+        for (int i = 0; i < n_backup_paths; i++) {
+            backup_ifaces[i] = file_cfg.backup_paths[i];
+        }
+    }
+
+    /* DNS: CLI servers override config DNS entirely */
+    if (n_dns == 0 && file_cfg.n_dns > 0) {
+        n_dns = file_cfg.n_dns;
+        for (int i = 0; i < n_dns; i++) {
+            dns_servers[i] = file_cfg.dns_servers[i];
+        }
+    }
+
+    if (strcmp(eff_mode, "client") == 0) {
+        if (!eff_server || eff_server[0] == '\0') {
+            fprintf(stderr, "error: --server is required for client mode\n");
+            return 1;
+        }
+
+        char host[256];
+        int port;
+        if (parse_host_port(eff_server, host, sizeof(host), &port) < 0) {
+            return 1;
+        }
+
+        if (eff_insecure) {
+            LOG_WRN("--insecure: accepting untrusted certificates");
+        }
+
+        int eff_reconnect = no_reconnect ? 0 : file_cfg.reconnect;
+
+        const char *eff_auth_key_client = eff_auth_key;
+        const char *eff_auth_username = file_cfg.auth_username[0] ? file_cfg.auth_username : NULL;
+        if (!eff_auth_key_client && eff_n_users > 0) {
+            /* User = NAME:KEY style: use first entry's key and name */
+            if (eff_n_users > 1)
+                LOG_WRN("client mode: only the first user credential is used");
+            eff_auth_key_client = eff_user_keys[0];
+            if (!eff_auth_username)
+                eff_auth_username = eff_user_names[0];
+        }
+        const char *eff_tls_name = tls_server_name ? tls_server_name
+                                   : file_cfg.tls_server_name[0]
+                                       ? file_cfg.tls_server_name
+                                       : NULL;
+
+        mqvpn_client_cfg_t cfg = {
+            .server_addr = host,
+            .server_port = port,
+            .tls_server_name = eff_tls_name,
+            .tun_name = eff_tun_name,
+            .tls_ciphers = (eff_tls_ciphers && eff_tls_ciphers[0]) ? eff_tls_ciphers : NULL,
+            .insecure = eff_insecure,
+            .log_level = log_level,
+            .n_paths = n_paths,
+            .n_backup_paths = n_backup_paths,
+            .scheduler = scheduler,
+            .reinjection_control = eff_reinjection_control,
+            .reinjection_mode = reinjection_mode,
+            .fec_enable = eff_fec_enable,
+            .fec_scheme = fec_scheme,
+            .cc = cc,
+            .auth_key = eff_auth_key_client,
+            .auth_username = eff_auth_username,
+            .n_dns = n_dns,
+            .reconnect = eff_reconnect,
+            .reconnect_interval = file_cfg.reconnect_interval,
+            .kill_switch = kill_switch >= 0 ? kill_switch : file_cfg.kill_switch,
+            .route_via_server = route_via_server >= 0 ? route_via_server
+                                                      : file_cfg.route_via_server,
+            .no_routes = no_routes >= 0 ? no_routes : file_cfg.no_routes,
+            .control_port = control_port ? control_port : file_cfg.control_port,
+            .control_addr = control_addr ? control_addr
+                          : (file_cfg.control_addr[0] ? file_cfg.control_addr : NULL),
+            .init_max_path_id = eff_init_max_path_id,
+            .tun_mtu = eff_tun_mtu,
+            /* INI [Reorder]/[ReorderRule]; always valid (mqvpn_config_defaults
+             * seeds mode OFF even with no [Reorder] section). No CLI flags in v1. */
+            .reorder = file_cfg.reorder,
+        };
+        for (int i = 0; i < n_paths; i++) {
+            cfg.path_ifaces[i] = path_ifaces[i];
+        }
+        for (int i = 0; i < n_backup_paths; i++) {
+            cfg.backup_ifaces[i] = backup_ifaces[i];
+        }
+        for (int i = 0; i < n_dns; i++) {
+            cfg.dns_servers[i] = dns_servers[i];
+        }
+#ifdef _WIN32
+        return win_platform_run_client(&cfg);
+#else
+        return linux_platform_run_client(&cfg);
+#endif
+
+    } else if (strcmp(eff_mode, "server") == 0) {
+        if ((!eff_auth_key || eff_auth_key[0] == '\0') && eff_n_users == 0) {
+            fprintf(stderr,
+                    "error: auth is required for server mode (--auth-key or --user)\n"
+                    "       generate one with: mqvpn --genkey\n");
+            return 1;
+        }
+
+        char bind_addr[256] = "0.0.0.0";
+        int bind_port = 443;
+        if (parse_host_port(eff_listen, bind_addr, sizeof(bind_addr), &bind_port) < 0) {
+            return 1;
+        }
+
+        mqvpn_server_cfg_t cfg = {
+            .listen_addr = bind_addr,
+            .listen_port = bind_port,
+            .subnet = eff_subnet,
+            .subnet6 = eff_subnet6,
+            .tun_name = eff_tun_name,
+            .cert_file = eff_cert,
+            .key_file = eff_key,
+            .tls_ciphers = (eff_tls_ciphers && eff_tls_ciphers[0]) ? eff_tls_ciphers : NULL,
+            .log_level = log_level,
+            .scheduler = scheduler,
+            .reinjection_control = eff_reinjection_control,
+            .reinjection_mode = reinjection_mode,
+            .fec_enable = eff_fec_enable,
+            .fec_scheme = fec_scheme,
+            .cc = cc,
+            .auth_key = eff_auth_key,
+            .n_users = eff_n_users,
+            .max_clients = eff_max_clients,
+            .control_addr = eff_control_addr,
+            .control_port = eff_control_port,
+            .init_max_path_id = eff_init_max_path_id,
+            .tun_mtu = eff_tun_mtu,
+            /* INI [Reorder]/[ReorderRule]; always valid (mqvpn_config_defaults
+             * seeds mode OFF even with no [Reorder] section). No CLI flags in v1. */
+            .reorder = file_cfg.reorder,
+        };
+        for (int i = 0; i < eff_n_users; i++) {
+            cfg.user_names[i] = eff_user_names[i];
+            cfg.user_keys[i] = eff_user_keys[i];
+            cfg.user_fixed_ips[i] = eff_user_fixed_ips[i];
+        }
+#ifdef _WIN32
+        return win_platform_run_server(&cfg);
+#else
+        return linux_platform_run_server(&cfg);
+#endif
+
+    } else {
+        fprintf(stderr, "error: --mode must be 'client' or 'server'\n");
+        return 1;
+    }
+}

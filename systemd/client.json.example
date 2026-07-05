@@ -1,0 +1,35 @@
+{
+  "mode": "client",
+  "server_addr": "your-server.example.com:443",
+  "auth_key": "<YOUR_PSK_HERE>",
+  "cipher": "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256",
+  "insecure": false,
+  "tun_name": "mqvpn0",
+  "dns": ["1.1.1.1", "8.8.8.8"],
+  "log_level": "info",
+  "kill_switch": false,
+  "reconnect": true,
+  "reconnect_interval": 5,
+  "route_via_server": false,
+  "no_routes": false,
+  "scheduler": "wlb",
+  "mtu": 0,
+  "cc": "bbr2",
+  "reinjection_control": true,
+  "reinjection_mode": "deadline",
+  "fec_enable": true,
+  "fec_scheme": "xor",
+  "paths": ["eth0", "wlan0"],
+  "backup_paths": [],
+  "control_port": 0,
+  "control_addr": "127.0.0.1",
+  "reorder": {
+    "enabled": "off",
+    "max_wait_ms": 30,
+    "cap_packets": 1024
+  },
+  "reorder_rules": [
+    { "proto": "udp", "port": 443, "profile": "fiber_lte" },
+    { "proto": "udp", "port": 53,  "profile": "default_udp" }
+  ]
+}

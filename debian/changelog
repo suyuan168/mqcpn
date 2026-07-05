@@ -1,0 +1,104 @@
+mqvpn (0.7.0-1) unstable; urgency=medium
+
+  * Add WRTT (Weighted Round-Trip Time) multipath scheduler: selects paths
+    by weight-to-RTT score; RTT acts as tiebreaker when weights are equal;
+    spills to secondary paths on cwnd congestion.
+  * Add set_path_weight control API command (client): adjust per-path WRTT
+    weight at runtime without reconnecting (range 0–65535; 0 = default/1).
+  * Raise MQVPN_MAX_PATHS cap from 4 to 8.
+  * fix(control): emit n_paths field in per-client get_status JSON response.
+  * fix(build): bump libmqvpn soversion for path ABI change.
+  * fix(build): forward-declare struct event_base in control_socket.h.
+  * Add test_control_response_bound unit test (worst-case JSON fits buffer).
+  * Add test_cli_path_argv shell test (8-path CLI argv overflow guard).
+
+ -- mqvpn maintainers <maintainers@example.com>  Thu, 04 Jun 2026 00:00:00 +0000
+
+mqvpn (0.6.0-1) unstable; urgency=medium
+
+  * Add configurable TUN MTU via --mtu CLI flag and INI/JSON config; cap
+    server per-client MTU notification to actual TUN MTU (#131, #132).
+  * Add --cc flag for congestion control selection (bbr2, bbr, cubic, none).
+  * Add wlb_udp_pin scheduler support (#140).
+  * Add routes management option (#143).
+  * Fix failover storm crash and add dynamic path budget expansion.
+  * Fix always reconnect on path_id=0 removal; fix double-rotation.
+  * Fix xqc_conn_close_path() failure when removing path_id=0.
+  * Fix path add/remove race.
+  * Fix JSON MTU upper bound to match INI parser (65535 → 9000).
+  * Raise max_path_id_grant_max_value from 64 to 128; bump xquic submodule
+    for reciprocal MAX_PATH_ID fix.
+
+ -- mqvpn maintainers <maintainers@example.com>  Mon, 01 Jun 2026 00:00:00 +0000
+
+mqvpn (0.5.0-1) unstable; urgency=medium
+
+  * Add QUIC draft-21 support (phase 1, #124).
+  * Add path FSM refactor: pre-active split, closed split, path add with
+    outcome, platform event API, and Linux external state removal (#88,
+    #112, #113, #115, #116, #117).
+  * Add support for up to 8 simultaneous paths (xquic limit).
+  * Fix control socket handling and add unit test.
+  * Fix get_interest timer extension (next_timer_ms only shortened, not
+    extended).
+  * Fix initial path removal regression and related tests.
+  * Fix path_stable_since_us re-arm per RFC spec §6.3; add
+    xqc_find_path_metrics helper.
+  * Fix multipath not enabled when only --control-port is set.
+  * Restore add_path / remove_path / list_paths control API commands.
+
+ -- mqvpn maintainers <maintainers@example.com>  Sun, 18 May 2026 00:00:00 +0000
+
+mqvpn (0.4.2-1) unstable; urgency=medium
+
+  * Fix server crash (SIGSEGV) when a non-H3 QUIC probe connects without
+    a matching ALPN — cb_write_socket and cb_path_removed blindly cast
+    mqvpn_server_t * to svr_conn_t * before H3 setup (issue #4282).
+  * Fix client busy-loop on -XQC_EMP_CREATE_PATH: close path permanently
+    instead of scheduling retries that can never succeed (OOM / cap hit).
+  * Fix netlink try_readd busy-loop during WiFi reassociation bursts.
+  * client: abort QUIC handshake after 5 s stall and rotate primary path.
+  * client: rotate primary path on reconnect to escape stale connections.
+  * Control API: unify listen address as "addr:port" via control_listen in
+    INI ([Control] Listen) and JSON (control_listen); legacy Port/Addr keys
+    remain supported for backward compatibility.
+  * Add fixed (pinned) per-user IP address support (server-side).
+  * Add congestion control setting in INI config file.
+  * Add unit test for server crash regression (non-H3 probe).
+  * Windows client support.
+
+ -- mqvpn maintainers <maintainers@example.com>  Thu, 07 May 2026 00:00:00 +0000
+
+mqvpn (0.3.2-1) unstable; urgency=medium
+
+  * Add experimental backup_fec multipath scheduler (FEC repair on standby path).
+  * Bump xquic to 4b93fb1 (fix FEC memory leak in repair symbol cleanup).
+  * Refactor scheduler dispatch into mqvpn_apply_scheduler() shared helper.
+  * Add test_scheduler unit test for scheduler dispatch.
+
+ -- mqvpn maintainers <maintainers@example.com>  Sat, 26 Apr 2026 00:00:00 +0000
+
+mqvpn (0.3.1-1) unstable; urgency=medium
+
+  * Add FEC (Forward Error Correction) and packet reinjection support.
+  * Add support for all xquic schedulers and congestion control settings.
+  * Add cipher suite configuration options.
+  * Add user authentication support (username in addition to pre-shared key).
+  * Add path rotation on startup.
+  * Add ICMP handling support.
+  * Backup mode: use xquic standby API for schedulers that support it.
+  * Add routes management options (--gateway, --no-gateway).
+  * Refactor tick() and client_new() into focused helper functions.
+  * Fix memory leaks in client teardown path.
+  * Fix multipath route detection errors.
+  * Merge main: CMakeLists.txt now includes icmp.c.
+
+ -- mqvpn maintainers <maintainers@example.com>  Sat, 25 Apr 2026 00:00:00 +0000
+
+mqvpn (0.3.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging.
+  * Add backup/failover path support (--backup-path).
+  * Add TCP control API for runtime user and path management.
+
+ -- mqvpn maintainers <maintainers@example.com>  Fri, 27 Mar 2026 00:00:00 +0000

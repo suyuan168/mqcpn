@@ -1,0 +1,1977 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 mp0rta and mqvpn contributors
+
+/*
+ * test_config.c — unit tests for INI config parser
+ *
+ * Build: cc -o tests/test_config tests/test_config.c src/config.c src/log.c -Isrc
+ */
+#include "config.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static int g_pass = 0, g_fail = 0;
+
+#define ASSERT_EQ_INT(a, b, msg)                                               \
+    do {                                                                       \
+        if ((a) == (b)) {                                                      \
+            g_pass++;                                                          \
+        } else {                                                               \
+            g_fail++;                                                          \
+            fprintf(stderr, "FAIL [%s]: %d != %d\n", msg, (int)(a), (int)(b)); \
+        }                                                                      \
+    } while (0)
+
+#define ASSERT_EQ_ULL(a, b, msg)                                                       \
+    do {                                                                               \
+        if ((a) == (b)) {                                                              \
+            g_pass++;                                                                  \
+        } else {                                                                       \
+            g_fail++;                                                                  \
+            fprintf(stderr, "FAIL [%s]: %llu != %llu\n", msg, (unsigned long long)(a), \
+                    (unsigned long long)(b));                                          \
+        }                                                                              \
+    } while (0)
+
+#define ASSERT_EQ_STR(a, b, msg)                                         \
+    do {                                                                 \
+        if (strcmp((a), (b)) == 0) {                                     \
+            g_pass++;                                                    \
+        } else {                                                         \
+            g_fail++;                                                    \
+            fprintf(stderr, "FAIL [%s]: '%s' != '%s'\n", msg, (a), (b)); \
+        }                                                                \
+    } while (0)
+
+#define ASSERT_TRUE(cond, msg)                   \
+    do {                                         \
+        if (cond) {                              \
+            g_pass++;                            \
+        } else {                                 \
+            g_fail++;                            \
+            fprintf(stderr, "FAIL [%s]\n", msg); \
+        }                                        \
+    } while (0)
+
+/* Helper: write string to a temp file and return path */
+static char *
+write_tmp(const char *content)
+{
+    static char path[256];
+    snprintf(path, sizeof(path), "/tmp/test_config_XXXXXX");
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        perror("mkstemp");
+        return NULL;
+    }
+    write(fd, content, strlen(content));
+    close(fd);
+    return path;
+}
+
+/* ---- Tests ---- */
+
+static void
+test_defaults(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+
+    ASSERT_EQ_STR(cfg.tun_name, "mqvpn0", "default tun_name");
+    ASSERT_EQ_STR(cfg.log_level, "info", "default log_level");
+    ASSERT_EQ_STR(cfg.listen, "0.0.0.0:443", "default listen");
+    ASSERT_EQ_STR(cfg.subnet, "10.0.0.0/24", "default subnet");
+    ASSERT_EQ_STR(cfg.cert_file, "server.crt", "default cert_file");
+    ASSERT_EQ_STR(cfg.key_file, "server.key", "default key_file");
+    ASSERT_EQ_STR(cfg.tls_ciphers, "", "default tls_ciphers");
+    ASSERT_EQ_INT(cfg.insecure, 0, "default insecure");
+    ASSERT_EQ_INT(cfg.max_clients, 64, "default max_clients");
+    ASSERT_EQ_INT(cfg.n_paths, 0, "default n_paths");
+    ASSERT_EQ_INT(cfg.n_dns, 0, "default n_dns");
+    ASSERT_EQ_STR(cfg.scheduler, "wlb", "default scheduler");
+    ASSERT_EQ_INT(cfg.reinjection_control, 0, "default reinjection_control");
+    ASSERT_EQ_STR(cfg.reinjection_mode, "default", "default reinjection_mode");
+    ASSERT_EQ_INT(cfg.fec_enable, 0, "default fec_enable");
+    ASSERT_EQ_STR(cfg.fec_scheme, "reed_solomon", "default fec_scheme");
+    ASSERT_EQ_STR(cfg.cc, "bbr2", "default cc");
+    ASSERT_EQ_INT(cfg.is_server, 0, "default is_server");
+    ASSERT_EQ_STR(cfg.server_addr, "", "default server_addr");
+    ASSERT_EQ_STR(cfg.auth_key, "", "default auth_key");
+    ASSERT_EQ_STR(cfg.server_auth_key, "", "default server_auth_key");
+}
+
+static void
+test_parse_server_config(void)
+{
+    const char *ini = "[Interface]\n"
+                      "TunName = tun-server\n"
+                      "Listen = 0.0.0.0:8443\n"
+                      "Subnet = 10.1.0.0/24\n"
+                      "LogLevel = debug\n"
+                      "\n"
+                      "[TLS]\n"
+                      "Cert = /etc/mqvpn/cert.pem\n"
+                      "Key = /etc/mqvpn/key.pem\n"
+                      "Cipher = TLS_AES_128_GCM_SHA256\n"
+                      "\n"
+                      "[Auth]\n"
+                      "Key = supersecretkey123\n"
+                      "MaxClients = 32\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "server config parse ok");
+    ASSERT_EQ_INT(cfg.is_server, 1, "detected server mode");
+    ASSERT_EQ_STR(cfg.tun_name, "tun-server", "tun_name");
+    ASSERT_EQ_STR(cfg.listen, "0.0.0.0:8443", "listen");
+    ASSERT_EQ_STR(cfg.subnet, "10.1.0.0/24", "subnet");
+    ASSERT_EQ_STR(cfg.log_level, "debug", "log_level");
+    ASSERT_EQ_STR(cfg.cert_file, "/etc/mqvpn/cert.pem", "cert_file");
+    ASSERT_EQ_STR(cfg.key_file, "/etc/mqvpn/key.pem", "key_file");
+    ASSERT_EQ_STR(cfg.tls_ciphers, "TLS_AES_128_GCM_SHA256", "tls_ciphers");
+    ASSERT_EQ_STR(cfg.server_auth_key, "supersecretkey123", "auth_key");
+    ASSERT_EQ_INT(cfg.max_clients, 32, "max_clients");
+}
+
+static void
+test_parse_client_config(void)
+{
+    const char *ini = "[Server]\n"
+                      "Address = vpn.example.com:443\n"
+                      "ServerName = sni.example.com\n"
+                      "Insecure = true\n"
+                      "\n"
+                      "[Auth]\n"
+                      "Key = myclientkey\n"
+                      "\n"
+                      "[Interface]\n"
+                      "TunName = tun-client\n"
+                      "DNS = 1.1.1.1, 8.8.8.8\n"
+                      "\n"
+                      "[Multipath]\n"
+                      "Scheduler = minrtt\n"
+                      "ReinjectionControl = true\n"
+                      "ReinjectionMode = deadline\n"
+                      "FecEnable = true\n"
+                      "FecScheme = xor\n"
+                      "Path = eth0\n"
+                      "Path = wlan0\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "client config parse ok");
+    ASSERT_EQ_INT(cfg.is_server, 0, "detected client mode");
+    ASSERT_EQ_STR(cfg.server_addr, "vpn.example.com:443", "server_addr");
+    ASSERT_EQ_STR(cfg.tls_server_name, "sni.example.com", "tls_server_name");
+    ASSERT_EQ_INT(cfg.insecure, 1, "insecure");
+    ASSERT_EQ_STR(cfg.auth_key, "myclientkey", "auth_key");
+    ASSERT_EQ_STR(cfg.tun_name, "tun-client", "tun_name");
+    ASSERT_EQ_INT(cfg.n_dns, 2, "n_dns");
+    ASSERT_EQ_STR(cfg.dns_servers[0], "1.1.1.1", "dns[0]");
+    ASSERT_EQ_STR(cfg.dns_servers[1], "8.8.8.8", "dns[1]");
+    ASSERT_EQ_STR(cfg.scheduler, "minrtt", "scheduler");
+    ASSERT_EQ_INT(cfg.reinjection_control, 1, "reinjection_control");
+    ASSERT_EQ_STR(cfg.reinjection_mode, "deadline", "reinjection_mode");
+    ASSERT_EQ_INT(cfg.fec_enable, 1, "fec_enable");
+    ASSERT_EQ_STR(cfg.fec_scheme, "xor", "fec_scheme");
+    ASSERT_EQ_INT(cfg.n_paths, 2, "n_paths");
+    ASSERT_EQ_STR(cfg.paths[0], "eth0", "path[0]");
+    ASSERT_EQ_STR(cfg.paths[1], "wlan0", "path[1]");
+}
+
+static void
+test_parse_scheduler_backup_fec(void)
+{
+    const char *ini = "[Server]\n"
+                      "Address = vpn.example.com:443\n"
+                      "\n"
+                      "[Auth]\n"
+                      "Key = myclientkey\n"
+                      "\n"
+                      "[Multipath]\n"
+                      "Scheduler = backup_fec\n"
+                      "Path = eth0\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "scheduler backup_fec config parse ok");
+    ASSERT_EQ_STR(cfg.scheduler, "backup_fec", "scheduler backup_fec");
+}
+
+static void
+test_parse_scheduler_wlb_udp_pin(void)
+{
+    const char *ini = "[Server]\n"
+                      "Address = vpn.example.com:443\n"
+                      "\n"
+                      "[Auth]\n"
+                      "Key = myclientkey\n"
+                      "\n"
+                      "[Multipath]\n"
+                      "Scheduler = wlb_udp_pin\n"
+                      "Path = eth0\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "scheduler wlb_udp_pin config parse ok");
+    ASSERT_EQ_STR(cfg.scheduler, "wlb_udp_pin", "scheduler wlb_udp_pin");
+}
+
+static void
+test_parse_cc_ini(void)
+{
+    const char *ini = "[Multipath]\n"
+                      "CC = bbr\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "cc ini parse ok");
+    ASSERT_EQ_STR(cfg.cc, "bbr", "cc bbr from INI");
+}
+
+static void
+test_parse_cc_json(void)
+{
+    const char *json = "{\"cc\": \"cubic\"}";
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load_json_filecfg(&cfg, json);
+
+    ASSERT_EQ_INT(rc, 0, "cc json parse ok");
+    ASSERT_EQ_STR(cfg.cc, "cubic", "cc cubic from JSON");
+}
+
+static void
+test_parse_init_max_path_id_bounds(void)
+{
+    const char *ini_ok = "[Multipath]\n"
+                         "InitMaxPathId = 4294967295\n";
+    char *path = write_tmp(ini_ok);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "InitMaxPathId max parse ok");
+    ASSERT_EQ_ULL(cfg.init_max_path_id, 4294967295ULL, "InitMaxPathId max stored");
+
+    const char *ini_bad = "[Multipath]\n"
+                          "InitMaxPathId = 4294967296\n";
+    path = write_tmp(ini_bad);
+    mqvpn_config_defaults(&cfg);
+    rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "InitMaxPathId overflow is warning-only");
+    ASSERT_EQ_ULL(cfg.init_max_path_id, 0, "InitMaxPathId overflow ignored");
+}
+
+static void
+test_parse_init_max_path_id_json_bounds(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load_json_filecfg(&cfg, "{\"init_max_path_id\":4294967295}");
+    ASSERT_EQ_INT(rc, 0, "JSON init_max_path_id max parse ok");
+    ASSERT_EQ_ULL(cfg.init_max_path_id, 4294967295ULL, "JSON init_max_path_id max");
+
+    mqvpn_config_defaults(&cfg);
+    rc = mqvpn_config_load_json_filecfg(&cfg, "{\"init_max_path_id\":4294967296}");
+    ASSERT_EQ_INT(rc, 0, "JSON init_max_path_id overflow is warning-only");
+    ASSERT_EQ_ULL(cfg.init_max_path_id, 0, "JSON init_max_path_id overflow ignored");
+}
+
+static void
+test_comments_whitespace(void)
+{
+    const char *ini = "# This is a comment\n"
+                      "; This is also a comment\n"
+                      "\n"
+                      "   [Interface]   \n"
+                      "  TunName   =   my-tun   \n"
+                      "  # inline not supported, just full-line\n"
+                      "\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "comment/whitespace parse ok");
+    ASSERT_EQ_STR(cfg.tun_name, "my-tun", "tun_name trimmed");
+}
+
+static void
+test_unknown_key_warns(void)
+{
+    const char *ini = "[Interface]\n"
+                      "TunName = test\n"
+                      "UnknownKey = somevalue\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    /* Should succeed (unknown keys are warned, not errors) */
+    ASSERT_EQ_INT(rc, 0, "unknown key no error");
+    ASSERT_EQ_STR(cfg.tun_name, "test", "known key still parsed");
+}
+
+static void
+test_missing_file_error(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, "/tmp/nonexistent_config_file_12345.conf");
+
+    ASSERT_TRUE(rc != 0, "missing file returns error");
+}
+
+static void
+test_path_accumulation(void)
+{
+    const char *ini = "[Multipath]\n"
+                      "Path = eth0\n"
+                      "Path = wlan0\n"
+                      "Path = usb0\n"
+                      "Path = lte0\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "path accumulation parse ok");
+    ASSERT_EQ_INT(cfg.n_paths, 4, "4 paths");
+    ASSERT_EQ_STR(cfg.paths[0], "eth0", "path[0]");
+    ASSERT_EQ_STR(cfg.paths[1], "wlan0", "path[1]");
+    ASSERT_EQ_STR(cfg.paths[2], "usb0", "path[2]");
+    ASSERT_EQ_STR(cfg.paths[3], "lte0", "path[3]");
+}
+
+static void
+test_dns_comma_split(void)
+{
+    const char *ini = "[Interface]\n"
+                      "DNS = 1.1.1.1,8.8.8.8, 9.9.9.9 ,  208.67.222.222  \n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "dns comma split parse ok");
+    ASSERT_EQ_INT(cfg.n_dns, 4, "4 dns servers");
+    ASSERT_EQ_STR(cfg.dns_servers[0], "1.1.1.1", "dns[0]");
+    ASSERT_EQ_STR(cfg.dns_servers[1], "8.8.8.8", "dns[1]");
+    ASSERT_EQ_STR(cfg.dns_servers[2], "9.9.9.9", "dns[2]");
+    ASSERT_EQ_STR(cfg.dns_servers[3], "208.67.222.222", "dns[3]");
+}
+
+static void
+test_boolean_parsing(void)
+{
+    /* Test various boolean representations */
+    const char *ini_true = "[Server]\n"
+                           "Address = host:443\n"
+                           "Insecure = true\n";
+
+    char *path = write_tmp(ini_true);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.insecure, 1, "insecure=true");
+
+    const char *ini_yes = "[Server]\n"
+                          "Address = host:443\n"
+                          "Insecure = yes\n";
+
+    path = write_tmp(ini_yes);
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.insecure, 1, "insecure=yes");
+
+    const char *ini_one = "[Server]\n"
+                          "Address = host:443\n"
+                          "Insecure = 1\n";
+
+    path = write_tmp(ini_one);
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.insecure, 1, "insecure=1");
+
+    const char *ini_false = "[Server]\n"
+                            "Address = host:443\n"
+                            "Insecure = false\n";
+
+    path = write_tmp(ini_false);
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.insecure, 0, "insecure=false");
+}
+
+static void
+test_mode_detection(void)
+{
+    /* Server: has [Interface] Listen → is_server=1 */
+    const char *ini_server = "[Interface]\n"
+                             "Listen = 0.0.0.0:443\n";
+
+    char *path = write_tmp(ini_server);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.is_server, 1, "Listen → server mode");
+
+    /* Client: has [Server] Address → is_server=0 */
+    const char *ini_client = "[Server]\n"
+                             "Address = host:443\n";
+
+    path = write_tmp(ini_client);
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.is_server, 0, "Address → client mode");
+}
+
+static void
+test_empty_file(void)
+{
+    const char *ini = "\n\n\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "empty file ok");
+}
+
+static void
+test_malformed_section_header(void)
+{
+    /* Missing closing bracket → should warn and skip, not crash */
+    const char *ini = "[Interface\n"
+                      "TunName = broken\n"
+                      "[Interface]\n"
+                      "TunName = fixed\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "malformed section no error");
+    /* First TunName is under malformed section (skipped), second is valid */
+    ASSERT_EQ_STR(cfg.tun_name, "fixed", "valid section parsed after malformed");
+}
+
+static void
+test_malformed_line_no_equals(void)
+{
+    /* Line without '=' → should warn and skip */
+    const char *ini = "[Interface]\n"
+                      "TunName = good\n"
+                      "this line has no equals\n"
+                      "LogLevel = debug\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "no-equals line no error");
+    ASSERT_EQ_STR(cfg.tun_name, "good", "key before malformed parsed");
+    ASSERT_EQ_STR(cfg.log_level, "debug", "key after malformed parsed");
+}
+
+static void
+test_key_outside_section(void)
+{
+    /* Key=Value before any [Section] → should warn */
+    const char *ini = "TunName = orphan\n"
+                      "[Interface]\n"
+                      "TunName = valid\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "key outside section no error");
+    ASSERT_EQ_STR(cfg.tun_name, "valid", "valid section key overrides orphan");
+}
+
+static void
+test_max_paths_exceeded(void)
+{
+    /* (MQVPN_CONFIG_MAX_PATHS + 1)th path should be ignored */
+    const char *ini = "[Multipath]\n"
+                      "Path = eth0\n"
+                      "Path = eth1\n"
+                      "Path = eth2\n"
+                      "Path = eth3\n"
+                      "Path = eth4\n"
+                      "Path = eth5\n"
+                      "Path = eth6\n"
+                      "Path = eth7\n"
+                      "Path = eth8\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "max paths exceeded no error");
+    ASSERT_EQ_INT(cfg.n_paths, MQVPN_CONFIG_MAX_PATHS, "capped at MAX paths");
+    ASSERT_EQ_STR(cfg.paths[MQVPN_CONFIG_MAX_PATHS - 1], "eth7",
+                  "last accepted path is eth7");
+}
+
+static void
+test_max_paths_exceeded_json(void)
+{
+    /* JSON path array exceeding cap must be silently capped (parity with INI). */
+    const char *json = "{"
+                       "\"mode\":\"client\","
+                       "\"server\":\"1.2.3.4:443\","
+                       "\"paths\":[\"eth0\",\"eth1\",\"eth2\",\"eth3\","
+                       "\"eth4\",\"eth5\",\"eth6\",\"eth7\",\"eth8\"]"
+                       "}";
+
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load_json_filecfg(&cfg, json);
+
+    ASSERT_EQ_INT(rc, 0, "JSON max paths exceeded no error");
+    ASSERT_EQ_INT(cfg.n_paths, MQVPN_CONFIG_MAX_PATHS, "JSON capped at MAX paths");
+    ASSERT_EQ_STR(cfg.paths[MQVPN_CONFIG_MAX_PATHS - 1], "eth7",
+                  "JSON last accepted path is eth7");
+}
+
+static void
+test_max_clients_edge_cases(void)
+{
+    /* MaxClients = 0 → should fallback to 64 */
+    const char *ini_zero = "[Auth]\n"
+                           "MaxClients = 0\n";
+
+    char *path = write_tmp(ini_zero);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=0 → default 64");
+
+    /* MaxClients = -1 → should fallback to 64 */
+    const char *ini_neg = "[Auth]\n"
+                          "MaxClients = -1\n";
+
+    path = write_tmp(ini_neg);
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=-1 → default 64");
+
+    /* MaxClients = abc → invalid, fallback to 64 */
+    const char *ini_abc = "[Auth]\n"
+                          "MaxClients = abc\n";
+
+    path = write_tmp(ini_abc);
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.max_clients, 64, "MaxClients=abc → default 64");
+
+    /* MaxClients = 128 → valid */
+    const char *ini_valid = "[Auth]\n"
+                            "MaxClients = 128\n";
+
+    path = write_tmp(ini_valid);
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.max_clients, 128, "MaxClients=128 → 128");
+}
+
+static void
+test_empty_value(void)
+{
+    /* Key with empty value → empty string */
+    const char *ini = "[Interface]\n"
+                      "TunName = \n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_STR(cfg.tun_name, "", "empty value → empty string");
+}
+
+static void
+test_duplicate_keys_last_wins(void)
+{
+    const char *ini = "[Interface]\n"
+                      "TunName = first\n"
+                      "TunName = second\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_STR(cfg.tun_name, "second", "duplicate key: last wins");
+}
+
+static void
+test_case_insensitive_section(void)
+{
+    /* Section names are case-insensitive */
+    const char *ini = "[interface]\n"
+                      "TunName = lower\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_STR(cfg.tun_name, "lower", "lowercase [interface] works");
+}
+
+static void
+test_unknown_section(void)
+{
+    /* Unknown section → keys under it should be warned, not crash */
+    const char *ini = "[Unknown]\n"
+                      "Foo = bar\n"
+                      "[Interface]\n"
+                      "TunName = after_unknown\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "unknown section no error");
+    ASSERT_EQ_STR(cfg.tun_name, "after_unknown", "key after unknown section parsed");
+}
+
+static void
+test_dns_empty_entries(void)
+{
+    /* Trailing comma, leading comma, double commas → no empty entries */
+    const char *ini = "[Interface]\n"
+                      "DNS = ,, 1.1.1.1 ,, 8.8.8.8 ,,\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.n_dns, 2, "empty DNS entries skipped");
+    ASSERT_EQ_STR(cfg.dns_servers[0], "1.1.1.1", "dns[0] after empty");
+    ASSERT_EQ_STR(cfg.dns_servers[1], "8.8.8.8", "dns[1] after empty");
+}
+
+static void
+test_semicolon_comment(void)
+{
+    const char *ini = "; semicolon comment\n"
+                      "[Interface]\n"
+                      "; another comment\n"
+                      "TunName = commented\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_STR(cfg.tun_name, "commented", "semicolon comments ignored");
+}
+
+/* ================================================================
+ *  Kill switch config tests
+ * ================================================================ */
+
+static void
+test_killswitch_default_off(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+
+    ASSERT_EQ_INT(cfg.kill_switch, 0, "default kill_switch off");
+}
+
+static void
+test_killswitch_config_parse(void)
+{
+    const char *ini = "[Interface]\n"
+                      "KillSwitch = true\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.kill_switch, 1, "kill_switch enabled from config");
+}
+
+static void
+test_killswitch_config_false(void)
+{
+    const char *ini = "[Interface]\n"
+                      "KillSwitch = false\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.kill_switch, 0, "kill_switch disabled from config");
+}
+
+static void
+test_manage_routes_default_on(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+
+    ASSERT_EQ_INT(cfg.no_routes, 0, "default no_routes off (routes managed)");
+}
+
+static void
+test_manage_routes_ini_false(void)
+{
+    const char *ini = "[Interface]\n"
+                      "NoRoutes = true\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.no_routes, 1, "no_routes enabled from INI");
+}
+
+/* ================================================================
+ *  Reconnect config tests
+ * ================================================================ */
+
+static void
+test_reconnect_defaults(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+
+    ASSERT_EQ_INT(cfg.reconnect, 1, "default reconnect enabled");
+    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "default reconnect interval 5s");
+}
+
+static void
+test_reconnect_config_parse(void)
+{
+    const char *ini = "[Interface]\n"
+                      "Reconnect = false\n"
+                      "ReconnectInterval = 10\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.reconnect, 0, "reconnect disabled from config");
+    ASSERT_EQ_INT(cfg.reconnect_interval, 10, "reconnect interval from config");
+}
+
+static void
+test_reconnect_config_true(void)
+{
+    const char *ini = "[Interface]\n"
+                      "Reconnect = true\n"
+                      "ReconnectInterval = 30\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.reconnect, 1, "reconnect enabled from config");
+    ASSERT_EQ_INT(cfg.reconnect_interval, 30, "reconnect interval 30s");
+}
+
+static void
+test_reconnect_interval_invalid(void)
+{
+    const char *ini = "[Interface]\n"
+                      "ReconnectInterval = -5\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "negative interval → default 5");
+}
+
+static void
+test_reconnect_interval_invalid_string(void)
+{
+    const char *ini = "[Interface]\n"
+                      "ReconnectInterval = abc\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.reconnect_interval, 5, "invalid interval → default 5");
+}
+
+/* ================================================================
+ *  MTU config tests
+ * ================================================================ */
+
+static void
+test_mtu_default(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    ASSERT_EQ_INT(cfg.tun_mtu, 0, "default tun_mtu is 0 (auto)");
+}
+
+static void
+test_mtu_config_parse(void)
+{
+    const char *ini = "[Interface]\nMTU = 1350\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.tun_mtu, 1350, "MTU 1350 parsed");
+}
+
+static void
+test_mtu_below_floor_ignored(void)
+{
+    const char *ini = "[Interface]\nMTU = 500\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.tun_mtu, 0, "MTU < 1280 ignored → stays 0");
+}
+
+static void
+test_mtu_above_ceiling_ignored(void)
+{
+    const char *ini = "[Interface]\nMTU = 9001\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.tun_mtu, 0, "MTU > 9000 ignored → stays 0");
+}
+
+static void
+test_mtu_invalid_string_ignored(void)
+{
+    const char *ini = "[Interface]\nMTU = abc\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_INT(cfg.tun_mtu, 0, "invalid MTU string ignored");
+}
+
+static void
+test_mtu_json_parse(void)
+{
+    const char *json = "{\"mtu\": 1400}";
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load_json_filecfg(&cfg, json);
+    ASSERT_EQ_INT(cfg.tun_mtu, 1400, "JSON MTU 1400 parsed");
+}
+
+/* ================================================================
+ *  Subnet6 config tests
+ * ================================================================ */
+
+static void
+test_subnet6_default(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+
+    ASSERT_EQ_STR(cfg.subnet6, "", "default subnet6 empty");
+}
+
+static void
+test_subnet6_config_parse(void)
+{
+    const char *ini = "[Interface]\n"
+                      "Listen = 0.0.0.0:443\n"
+                      "Subnet = 10.0.0.0/24\n"
+                      "Subnet6 = fd00:abcd::/112\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "subnet6 config parse ok");
+    ASSERT_EQ_STR(cfg.subnet6, "fd00:abcd::/112", "subnet6 parsed");
+}
+
+static void
+test_subnet6_various_prefixes(void)
+{
+    /* /96 prefix */
+    const char *ini_96 = "[Interface]\n"
+                         "Listen = 0.0.0.0:443\n"
+                         "Subnet6 = fd00:1234::/96\n";
+
+    char *path = write_tmp(ini_96);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_STR(cfg.subnet6, "fd00:1234::/96", "subnet6 /96 stored");
+
+    /* /126 prefix */
+    const char *ini_126 = "[Interface]\n"
+                          "Listen = 0.0.0.0:443\n"
+                          "Subnet6 = fd00:abcd:ef01::/126\n";
+
+    path = write_tmp(ini_126);
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_STR(cfg.subnet6, "fd00:abcd:ef01::/126", "subnet6 /126 stored");
+}
+
+static void
+test_subnet6_whitespace_trimmed(void)
+{
+    const char *ini = "[Interface]\n"
+                      "Listen = 0.0.0.0:443\n"
+                      "Subnet6 =   fd00:abcd::/112   \n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_STR(cfg.subnet6, "fd00:abcd::/112", "subnet6 whitespace trimmed");
+}
+
+static void
+test_subnet6_not_set(void)
+{
+    /* Server config without Subnet6 → subnet6 stays empty */
+    const char *ini = "[Interface]\n"
+                      "Listen = 0.0.0.0:443\n"
+                      "Subnet = 10.0.0.0/24\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_STR(cfg.subnet6, "", "subnet6 empty when not set");
+}
+
+static void
+test_subnet6_duplicate_last_wins(void)
+{
+    const char *ini = "[Interface]\n"
+                      "Listen = 0.0.0.0:443\n"
+                      "Subnet6 = fd00:1::/112\n"
+                      "Subnet6 = fd00:2::/112\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+    ASSERT_EQ_STR(cfg.subnet6, "fd00:2::/112", "subnet6 duplicate: last wins");
+}
+
+static void
+test_auth_users_ini(void)
+{
+    const char *ini = "[Interface]\n"
+                      "Listen = 0.0.0.0:443\n"
+                      "[Auth]\n"
+                      "User = alice:alice-key\n"
+                      "User = bob:bob-key\n"
+                      "User = alice:alice-key-v2\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "auth users ini parse ok");
+    ASSERT_EQ_INT(cfg.n_users, 2, "2 users parsed");
+    ASSERT_EQ_STR(cfg.user_names[0], "alice", "user[0] name");
+    ASSERT_EQ_STR(cfg.user_keys[0], "alice-key-v2", "user[0] updated key");
+    ASSERT_EQ_STR(cfg.user_names[1], "bob", "user[1] name");
+}
+
+static void
+test_auth_users_ini_plain_name_sets_auth_username(void)
+{
+    /* In any config, User = name (no colon) → stores as auth_username, not n_users */
+    const char *ini = "[Interface]\n"
+                      "Listen = 0.0.0.0:443\n"
+                      "[Auth]\n"
+                      "User = plain-name\n"
+                      "User = alice:alice-key\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "plain user name parse ok");
+    ASSERT_EQ_STR(cfg.auth_username, "plain-name", "plain User stores in auth_username");
+    ASSERT_EQ_INT(cfg.n_users, 1, "NAME:KEY user still parsed");
+    ASSERT_EQ_STR(cfg.user_names[0], "alice", "NAME:KEY user name");
+}
+
+static void
+test_json_config_load(void)
+{
+    const char *json = "{"
+                       "\"mode\":\"server\","
+                       "\"listen\":\"0.0.0.0:8443\","
+                       "\"subnet\":\"10.20.0.0/24\","
+                       "\"auth_key\":\"legacy\","
+                       "\"max_clients\":120,"
+                       "\"paths\":[\"eth0\",\"wlan0\"],"
+                       "\"dns\":[\"1.1.1.1\",\"8.8.8.8\"],"
+                       "\"users\":[{\"name\":\"alice\",\"key\":\"a1\"},\"bob:b2\"]"
+                       "}";
+
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "json config parse ok");
+    ASSERT_EQ_INT(cfg.is_server, 1, "json mode server");
+    ASSERT_EQ_STR(cfg.listen, "0.0.0.0:8443", "json listen");
+    ASSERT_EQ_STR(cfg.subnet, "10.20.0.0/24", "json subnet");
+    ASSERT_EQ_INT(cfg.max_clients, 120, "json max clients");
+    ASSERT_EQ_INT(cfg.n_paths, 2, "json paths");
+    ASSERT_EQ_STR(cfg.paths[1], "wlan0", "json path[1]");
+    ASSERT_EQ_INT(cfg.n_dns, 2, "json dns");
+    ASSERT_EQ_INT(cfg.n_users, 2, "json users");
+    ASSERT_EQ_STR(cfg.user_names[0], "alice", "json user[0]");
+}
+
+static void
+test_json_client_config_load(void)
+{
+    const char *json = "{"
+                       "\"mode\":\"client\","
+                       "\"server_addr\":\"vpn.example.com:443\","
+                       "\"tls_server_name\":\"sni.example.com\","
+                       "\"auth_key\":\"client-key\","
+                       "\"insecure\":true,"
+                       "\"tun_name\":\"mqvpn7\","
+                       "\"log_level\":\"debug\","
+                       "\"dns\":[\"1.1.1.1\",\"8.8.8.8\"],"
+                       "\"paths\":[\"eth0\",\"wlan0\"],"
+                       "\"reconnect\":false,"
+                       "\"reconnect_interval\":9,"
+                       "\"kill_switch\":true,"
+                       "\"no_routes\":true,"
+                       "\"scheduler\":\"minrtt\""
+                       "}";
+
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "json client config parse ok");
+    ASSERT_EQ_INT(cfg.is_server, 0, "json client mode");
+    ASSERT_EQ_STR(cfg.server_addr, "vpn.example.com:443", "json client server_addr");
+    ASSERT_EQ_STR(cfg.tls_server_name, "sni.example.com", "json client tls_server_name");
+    ASSERT_EQ_STR(cfg.auth_key, "client-key", "json client auth_key");
+    ASSERT_EQ_INT(cfg.insecure, 1, "json client insecure");
+    ASSERT_EQ_STR(cfg.tun_name, "mqvpn7", "json client tun_name");
+    ASSERT_EQ_STR(cfg.log_level, "debug", "json client log_level");
+    ASSERT_EQ_INT(cfg.n_dns, 2, "json client dns count");
+    ASSERT_EQ_STR(cfg.dns_servers[1], "8.8.8.8", "json client dns[1]");
+    ASSERT_EQ_INT(cfg.n_paths, 2, "json client path count");
+    ASSERT_EQ_STR(cfg.paths[0], "eth0", "json client path[0]");
+    ASSERT_EQ_INT(cfg.reconnect, 0, "json client reconnect");
+    ASSERT_EQ_INT(cfg.reconnect_interval, 9, "json client reconnect interval");
+    ASSERT_EQ_INT(cfg.kill_switch, 1, "json client kill switch");
+    ASSERT_EQ_INT(cfg.no_routes, 1, "json client no_routes");
+    ASSERT_EQ_STR(cfg.scheduler, "minrtt", "json client scheduler");
+}
+
+static void
+test_auth_users_ini_with_fixed_ip(void)
+{
+    /* User = name:key:fixed_ip stores the fixed IP alongside the user entry */
+    const char *ini = "[Interface]\n"
+                      "Listen = 0.0.0.0:443\n"
+                      "[Auth]\n"
+                      "User = alice:alice-secret:10.0.0.5\n"
+                      "User = bob:bob-secret\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "fixed IP user ini parse ok");
+    ASSERT_EQ_INT(cfg.n_users, 2, "2 users parsed");
+    ASSERT_EQ_STR(cfg.user_names[0], "alice", "user[0] name");
+    ASSERT_EQ_STR(cfg.user_keys[0], "alice-secret", "user[0] key");
+    ASSERT_EQ_STR(cfg.user_fixed_ips[0], "10.0.0.5", "user[0] fixed IP");
+    ASSERT_EQ_STR(cfg.user_names[1], "bob", "user[1] name");
+    ASSERT_EQ_STR(cfg.user_fixed_ips[1], "", "user[1] no fixed IP");
+}
+
+static void
+test_json_users_with_fixed_ip(void)
+{
+    /* JSON object users may include an optional "fixed_ip" field */
+    const char *json = "{"
+                       "\"listen\":\"0.0.0.0:443\","
+                       "\"users\":["
+                       "{\"name\":\"alice\",\"key\":\"a1\",\"fixed_ip\":\"10.0.0.5\"},"
+                       "{\"name\":\"bob\",\"key\":\"b1\"}"
+                       "]}";
+
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "json user fixed_ip parse ok");
+    ASSERT_EQ_INT(cfg.n_users, 2, "2 users parsed");
+    ASSERT_EQ_STR(cfg.user_names[0], "alice", "json user[0] name");
+    ASSERT_EQ_STR(cfg.user_fixed_ips[0], "10.0.0.5", "json user[0] fixed_ip");
+    ASSERT_EQ_STR(cfg.user_names[1], "bob", "json user[1] name");
+    ASSERT_EQ_STR(cfg.user_fixed_ips[1], "", "json user[1] no fixed_ip");
+}
+
+static void
+test_parse_json_scheduler_wlb_udp_pin(void)
+{
+    const char *json = "{"
+                       "\"mode\":\"client\","
+                       "\"server_addr\":\"vpn.example.com:443\","
+                       "\"auth_key\":\"k\","
+                       "\"paths\":[\"eth0\"],"
+                       "\"scheduler\":\"wlb_udp_pin\""
+                       "}";
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "json scheduler wlb_udp_pin parse ok");
+    ASSERT_EQ_STR(cfg.scheduler, "wlb_udp_pin", "json scheduler wlb_udp_pin");
+}
+
+static void
+test_json_duplicate_users_last_wins(void)
+{
+    const char *json = "{"
+                       "\"listen\":\"0.0.0.0:443\","
+                       "\"users\":[\"alice:old\", {\"name\":\"alice\",\"key\":\"new\"}]"
+                       "}";
+
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "json duplicate users parse ok");
+    ASSERT_EQ_INT(cfg.n_users, 1, "json duplicate users collapsed");
+    ASSERT_EQ_STR(cfg.user_keys[0], "new", "json duplicate user last wins");
+}
+
+static void
+test_json_invalid_users_error(void)
+{
+    const char *json = "{"
+                       "\"listen\":\"0.0.0.0:443\","
+                       "\"users\":[{\"name\":\"alice\"}]"
+                       "}";
+
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_TRUE(rc != 0, "json invalid users returns error");
+}
+
+/* ================================================================
+ *  RouteViaServer config tests
+ * ================================================================ */
+
+static void test_route_via_server_default_off(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+
+    ASSERT_EQ_INT(cfg.route_via_server, 0, "default route_via_server off");
+}
+
+static void test_route_via_server_config_parse(void)
+{
+    const char *ini =
+        "[Interface]\n"
+        "RouteViaServer = true\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.route_via_server, 1, "route_via_server enabled from config");
+}
+
+static void test_route_via_server_config_false(void)
+{
+    const char *ini =
+        "[Interface]\n"
+        "RouteViaServer = false\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.route_via_server, 0, "route_via_server stays off when false");
+}
+
+/* ================================================================
+ *  NoRoutes config tests
+ * ================================================================ */
+
+static void test_no_routes_default_off(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+
+    ASSERT_EQ_INT(cfg.no_routes, 0, "default no_routes off");
+}
+
+static void test_no_routes_config_parse(void)
+{
+    const char *ini =
+        "[Interface]\n"
+        "NoRoutes = yes\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.no_routes, 1, "no_routes enabled from config");
+}
+
+static void test_no_routes_config_false(void)
+{
+    const char *ini =
+        "[Interface]\n"
+        "NoRoutes = no\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.no_routes, 0, "no_routes stays off when no");
+}
+
+static void test_json_client_route_options(void)
+{
+    const char *json =
+        "{"
+        "\"mode\":\"client\","
+        "\"server_addr\":\"vpn.example.com:443\","
+        "\"route_via_server\":true,"
+        "\"no_routes\":false"
+        "}";
+
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "json route options parse ok");
+    ASSERT_EQ_INT(cfg.route_via_server, 1, "json route_via_server true");
+    ASSERT_EQ_INT(cfg.no_routes, 0, "json no_routes false");
+}
+
+static void test_json_client_no_routes(void)
+{
+    const char *json =
+        "{"
+        "\"mode\":\"client\","
+        "\"server_addr\":\"vpn.example.com:443\","
+        "\"no_routes\":true"
+        "}";
+
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "json no_routes parse ok");
+    ASSERT_EQ_INT(cfg.no_routes, 1, "json no_routes true");
+    ASSERT_EQ_INT(cfg.route_via_server, 0, "json route_via_server unset stays 0");
+}
+
+/* ================================================================
+ *  Backup path config tests
+ * ================================================================ */
+
+static void test_backup_path_default_empty(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+
+    ASSERT_EQ_INT(cfg.n_backup_paths, 0, "default n_backup_paths is 0");
+}
+
+static void test_backup_path_ini_parse(void)
+{
+    const char *ini =
+        "[Multipath]\n"
+        "Path = eth0\n"
+        "BackupPath = lte0\n"
+        "BackupPath = wlan0\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(cfg.n_paths, 1, "primary path parsed");
+    ASSERT_EQ_STR(cfg.paths[0], "eth0", "primary path[0]");
+    ASSERT_EQ_INT(cfg.n_backup_paths, 2, "2 backup paths parsed");
+    ASSERT_EQ_STR(cfg.backup_paths[0], "lte0", "backup_path[0]");
+    ASSERT_EQ_STR(cfg.backup_paths[1], "wlan0", "backup_path[1]");
+}
+
+static void test_backup_path_ini_max_cap(void)
+{
+    /* 9 backup paths → capped at MQVPN_CONFIG_MAX_PATHS (8) */
+    const char *ini =
+        "[Multipath]\n"
+        "BackupPath = b0\n"
+        "BackupPath = b1\n"
+        "BackupPath = b2\n"
+        "BackupPath = b3\n"
+        "BackupPath = b4\n"
+        "BackupPath = b5\n"
+        "BackupPath = b6\n"
+        "BackupPath = b7\n"
+        "BackupPath = b8\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "backup path cap no error");
+    ASSERT_EQ_INT(cfg.n_backup_paths, 8, "capped at 8 backup paths");
+    ASSERT_EQ_STR(cfg.backup_paths[7], "b7", "backup_path[7]");
+}
+
+static void test_backup_path_json_parse(void)
+{
+    const char *json =
+        "{"
+        "\"mode\":\"client\","
+        "\"server_addr\":\"vpn.example.com:443\","
+        "\"paths\":[\"eth0\"],"
+        "\"backup_paths\":[\"lte0\",\"wlan0\"]"
+        "}";
+
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "json backup_paths parse ok");
+    ASSERT_EQ_INT(cfg.n_paths, 1, "json primary path count");
+    ASSERT_EQ_STR(cfg.paths[0], "eth0", "json primary path[0]");
+    ASSERT_EQ_INT(cfg.n_backup_paths, 2, "json backup_paths count");
+    ASSERT_EQ_STR(cfg.backup_paths[0], "lte0", "json backup_path[0]");
+    ASSERT_EQ_STR(cfg.backup_paths[1], "wlan0", "json backup_path[1]");
+}
+
+/* ================================================================
+ *  Client auth: User + Key fields
+ * ================================================================ */
+
+static void test_client_auth_username_default_empty(void)
+{
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+
+    ASSERT_EQ_STR(cfg.auth_username, "", "default auth_username empty");
+}
+
+static void test_client_auth_user_plain(void)
+{
+    /* User = alice (no colon) in client config sets auth_username */
+    const char *ini =
+        "[Server]\n"
+        "Address = vpn.example.com:443\n"
+        "[Auth]\n"
+        "User = alice\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "client plain User parse ok");
+    ASSERT_EQ_STR(cfg.auth_username, "alice", "auth_username set from User");
+    ASSERT_EQ_INT(cfg.n_users, 0, "no user list entries");
+}
+
+static void test_client_auth_user_and_key(void)
+{
+    /* User = alice + Key = secret → auth_username + auth_key, no user list */
+    const char *ini =
+        "[Server]\n"
+        "Address = vpn.example.com:443\n"
+        "[Auth]\n"
+        "User = alice\n"
+        "Key = mysecretkey\n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "client User+Key parse ok");
+    ASSERT_EQ_STR(cfg.auth_username, "alice", "auth_username from User");
+    ASSERT_EQ_STR(cfg.auth_key, "mysecretkey", "auth_key from Key");
+    ASSERT_EQ_INT(cfg.n_users, 0, "no user list entries");
+}
+
+static void test_client_auth_user_whitespace_trimmed(void)
+{
+    const char *ini =
+        "[Server]\n"
+        "Address = vpn.example.com:443\n"
+        "[Auth]\n"
+        "User =   bob  \n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "client User whitespace parse ok");
+    ASSERT_EQ_STR(cfg.auth_username, "bob", "auth_username whitespace trimmed");
+}
+
+static void test_client_auth_user_empty_ignored(void)
+{
+    /* User = (empty) → auth_username stays empty */
+    const char *ini =
+        "[Server]\n"
+        "Address = vpn.example.com:443\n"
+        "[Auth]\n"
+        "User = \n";
+
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "empty User no error");
+    ASSERT_EQ_STR(cfg.auth_username, "", "empty User leaves auth_username empty");
+}
+
+static void test_backup_path_json_empty_array(void)
+{
+    const char *json =
+        "{"
+        "\"mode\":\"client\","
+        "\"server_addr\":\"vpn.example.com:443\","
+        "\"backup_paths\":[]"
+        "}";
+
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "json empty backup_paths ok");
+    ASSERT_EQ_INT(cfg.n_backup_paths, 0, "json empty backup_paths count is 0");
+}
+
+/* ================================================================
+ *  Buffer boundary and edge case tests
+ * ================================================================ */
+
+static void
+test_tun_name_max_length(void)
+{
+    char long_name[64];
+    memset(long_name, 'A', 63);
+    long_name[63] = '\0';
+    char ini[256];
+    snprintf(ini, sizeof(ini), "[Interface]\nTunName = %s\n", long_name);
+    char *f = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    ASSERT_EQ_INT(mqvpn_config_load(&cfg, f), 0, "load long TunName");
+    ASSERT_TRUE(strlen(cfg.tun_name) < 32, "TunName truncated to buffer size");
+    unlink(f);
+}
+
+static void
+test_dns_exceeds_max(void)
+{
+    const char *ini = "[Interface]\n"
+                      "DNS = 1.1.1.1, 8.8.8.8, 8.8.4.4, 9.9.9.9, 208.67.222.222\n";
+    char *f = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, f);
+    ASSERT_EQ_INT(cfg.n_dns, 4, "DNS capped at 4");
+    unlink(f);
+}
+
+static void
+test_reconnect_interval_overflow(void)
+{
+    const char *ini = "[Interface]\n"
+                      "Reconnect = true\n"
+                      "ReconnectInterval = 999999999\n";
+    char *f = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, f);
+    ASSERT_EQ_INT(cfg.reconnect_interval, 999999999,
+                  "huge interval stored as-is (no upper clamp)");
+    unlink(f);
+}
+
+static void
+test_value_contains_equals(void)
+{
+    const char *ini = "[Auth]\n"
+                      "Key = abc=def=ghi\n";
+    char *f = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    mqvpn_config_load(&cfg, f);
+    ASSERT_EQ_STR(cfg.auth_key, "abc=def=ghi", "value with = preserved");
+    unlink(f);
+}
+
+static void
+test_parse_control_section(void)
+{
+    const char *ini = "[Interface]\n"
+                      "Listen = 0.0.0.0:443\n"
+                      "\n"
+                      "[Control]\n"
+                      "Listen = 127.0.0.1:9090\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "[Control] parse ok");
+    ASSERT_EQ_STR(cfg.control_listen, "127.0.0.1:9090", "control_listen");
+}
+
+static void
+test_parse_control_absent(void)
+{
+    const char *ini = "[Interface]\n"
+                      "Listen = 0.0.0.0:443\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "no [Control] is ok");
+    ASSERT_EQ_STR(cfg.control_listen, "", "control_listen empty when section absent");
+}
+
+static void
+test_parse_control_json(void)
+{
+    const char *json = "{ \"mode\": \"server\","
+                       "  \"listen\": \"0.0.0.0:443\","
+                       "  \"control_listen\": \"1.2.3.4:9091\" }";
+    char *path = write_tmp(json);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "JSON control_listen parse ok");
+    ASSERT_EQ_STR(cfg.control_listen, "1.2.3.4:9091", "JSON control_listen");
+}
+
+static void
+test_parse_control_unknown_key(void)
+{
+    const char *ini = "[Interface]\n"
+                      "Listen = 0.0.0.0:443\n"
+                      "\n"
+                      "[Control]\n"
+                      "Foo = bar\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "[Control] unknown key is non-fatal");
+    ASSERT_EQ_STR(cfg.control_listen, "", "control_listen unchanged on unknown key");
+}
+
+/* ================================================================
+ *  mqvpn_resolve_control_endpoint helper tests (per-field merge)
+ * ================================================================ */
+
+static void
+test_resolve_ini_only(void)
+{
+    char buf[256] = {0};
+    const char *out_addr = NULL;
+    int out_port = 0;
+    int rc = mqvpn_resolve_control_endpoint("127.0.0.1:9090", /* file_listen */
+                                            NULL,             /* cli_addr */
+                                            0, 0,             /* cli_port, cli_port_set */
+                                            buf, sizeof(buf), &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, 0, "resolve INI only ok");
+    ASSERT_EQ_INT(out_port, 9090, "INI port");
+    ASSERT_TRUE(out_addr != NULL && strcmp(out_addr, "127.0.0.1") == 0, "INI addr");
+}
+
+static void
+test_resolve_cli_port_overrides(void)
+{
+    char buf[256] = {0};
+    const char *out_addr = NULL;
+    int out_port = 0;
+    int rc = mqvpn_resolve_control_endpoint("127.0.0.1:9090", NULL, 9091, 1, buf,
+                                            sizeof(buf), &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, 0, "resolve CLI port override ok");
+    ASSERT_EQ_INT(out_port, 9091, "CLI port wins");
+    ASSERT_TRUE(out_addr != NULL && strcmp(out_addr, "127.0.0.1") == 0,
+                "INI addr preserved");
+}
+
+static void
+test_resolve_cli_addr_overrides(void)
+{
+    char buf[256] = {0};
+    const char *out_addr = NULL;
+    int out_port = 0;
+    int rc = mqvpn_resolve_control_endpoint("127.0.0.1:9090", "0.0.0.0", 0, 0, buf,
+                                            sizeof(buf), &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, 0, "resolve CLI addr override ok");
+    ASSERT_EQ_INT(out_port, 9090, "INI port preserved");
+    ASSERT_TRUE(out_addr != NULL && strcmp(out_addr, "0.0.0.0") == 0, "CLI addr wins");
+}
+
+static void
+test_resolve_explicit_disable(void)
+{
+    char buf[256] = {0};
+    const char *out_addr = NULL;
+    int out_port = -1;
+    int rc = mqvpn_resolve_control_endpoint("127.0.0.1:9090", NULL, 0,
+                                            1, /* cli_port=0, cli_port_set=1 */
+                                            buf, sizeof(buf), &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, 0, "resolve explicit disable ok");
+    ASSERT_EQ_INT(out_port, 0, "--control-port 0 disables even when INI is set");
+}
+
+static void
+test_resolve_no_input(void)
+{
+    char buf[256] = {0};
+    const char *out_addr = NULL;
+    int out_port = -1;
+    int rc = mqvpn_resolve_control_endpoint("", NULL, 0, 0, buf, sizeof(buf), &out_addr,
+                                            &out_port);
+    ASSERT_EQ_INT(rc, 0, "resolve no input ok");
+    ASSERT_EQ_INT(out_port, 0, "disabled when no INI and no CLI");
+    ASSERT_TRUE(out_addr == NULL, "addr stays NULL when no input");
+}
+
+static void
+test_resolve_malformed_ini(void)
+{
+    char buf[256] = {0};
+    const char *out_addr = NULL;
+    int out_port = -1;
+    int rc = mqvpn_resolve_control_endpoint("not_a_host_port", NULL, 0, 0, buf,
+                                            sizeof(buf), &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, -1, "malformed INI returns -1");
+}
+
+static void
+test_resolve_trailing_garbage_port(void)
+{
+    /* "9090garbage" must NOT silently parse as 9090 — strtol contract. */
+    char buf[256] = {0};
+    const char *out_addr = NULL;
+    int out_port = -1;
+    int rc = mqvpn_resolve_control_endpoint("127.0.0.1:9090garbage", NULL, 0, 0, buf,
+                                            sizeof(buf), &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, -1, "trailing garbage in port returns -1");
+
+    /* Same for IPv6 bracket form. */
+    rc = mqvpn_resolve_control_endpoint("[::1]:9090garbage", NULL, 0, 0, buf, sizeof(buf),
+                                        &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, -1, "trailing garbage in v6 port returns -1");
+}
+
+static void
+test_resolve_port_leading_junk(void)
+{
+    /* Port must be a bare unsigned decimal — no leading whitespace, no sign. */
+    char buf[256] = {0};
+    const char *out_addr = NULL;
+    int out_port = -1;
+
+    int rc = mqvpn_resolve_control_endpoint("127.0.0.1: 9090", NULL, 0, 0, buf,
+                                            sizeof(buf), &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, -1, "leading whitespace in port returns -1");
+
+    rc = mqvpn_resolve_control_endpoint("127.0.0.1:+9090", NULL, 0, 0, buf, sizeof(buf),
+                                        &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, -1, "leading + sign in port returns -1");
+
+    rc = mqvpn_resolve_control_endpoint("127.0.0.1:-9090", NULL, 0, 0, buf, sizeof(buf),
+                                        &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, -1, "leading - sign in port returns -1");
+
+    rc = mqvpn_resolve_control_endpoint("127.0.0.1:", NULL, 0, 0, buf, sizeof(buf),
+                                        &out_addr, &out_port);
+    ASSERT_EQ_INT(rc, -1, "empty port returns -1");
+}
+
+int
+main(void)
+{
+    test_defaults();
+    test_parse_server_config();
+    test_parse_client_config();
+    test_parse_scheduler_backup_fec();
+    test_parse_scheduler_wlb_udp_pin();
+    test_parse_cc_ini();
+    test_parse_cc_json();
+    test_parse_init_max_path_id_bounds();
+    test_parse_init_max_path_id_json_bounds();
+    test_comments_whitespace();
+    test_unknown_key_warns();
+    test_missing_file_error();
+    test_path_accumulation();
+    test_dns_comma_split();
+    test_boolean_parsing();
+    test_mode_detection();
+    test_empty_file();
+    test_malformed_section_header();
+    test_malformed_line_no_equals();
+    test_key_outside_section();
+    test_max_paths_exceeded();
+    test_max_paths_exceeded_json();
+    test_max_clients_edge_cases();
+    test_empty_value();
+    test_duplicate_keys_last_wins();
+    test_case_insensitive_section();
+    test_unknown_section();
+    test_dns_empty_entries();
+    test_semicolon_comment();
+
+    /* kill switch tests */
+    test_killswitch_default_off();
+    test_killswitch_config_parse();
+    test_killswitch_config_false();
+
+    /* manage_routes tests */
+    test_manage_routes_default_on();
+    test_manage_routes_ini_false();
+
+    /* reconnect tests */
+    test_reconnect_defaults();
+    test_reconnect_config_parse();
+    test_reconnect_config_true();
+    test_reconnect_interval_invalid();
+    test_reconnect_interval_invalid_string();
+
+    /* MTU tests */
+    test_mtu_default();
+    test_mtu_config_parse();
+    test_mtu_below_floor_ignored();
+    test_mtu_above_ceiling_ignored();
+    test_mtu_invalid_string_ignored();
+    test_mtu_json_parse();
+
+    /* subnet6 tests */
+    test_subnet6_default();
+    test_subnet6_config_parse();
+    test_subnet6_various_prefixes();
+    test_subnet6_whitespace_trimmed();
+    test_subnet6_not_set();
+    test_subnet6_duplicate_last_wins();
+    test_auth_users_ini();
+    test_auth_users_ini_plain_name_sets_auth_username();
+    test_auth_users_ini_with_fixed_ip();
+    test_json_config_load();
+    test_json_client_config_load();
+    test_json_users_with_fixed_ip();
+    test_parse_json_scheduler_wlb_udp_pin();
+    test_json_duplicate_users_last_wins();
+    test_json_invalid_users_error();
+
+    /* route_via_server tests */
+    test_route_via_server_default_off();
+    test_route_via_server_config_parse();
+    test_route_via_server_config_false();
+
+    /* no_routes tests */
+    test_no_routes_default_off();
+    test_no_routes_config_parse();
+    test_no_routes_config_false();
+    test_json_client_route_options();
+    test_json_client_no_routes();
+
+    /* client auth: User + Key */
+    test_client_auth_username_default_empty();
+    test_client_auth_user_plain();
+    test_client_auth_user_and_key();
+    test_client_auth_user_whitespace_trimmed();
+    test_client_auth_user_empty_ignored();
+
+    /* backup path tests */
+    test_backup_path_default_empty();
+    test_backup_path_ini_parse();
+    test_backup_path_ini_max_cap();
+    test_backup_path_json_parse();
+    test_backup_path_json_empty_array();
+
+    /* buffer boundary and edge case tests */
+    test_tun_name_max_length();
+    test_dns_exceeds_max();
+    test_reconnect_interval_overflow();
+    test_value_contains_equals();
+
+    /* [Control] section tests */
+    test_parse_control_section();
+    test_parse_control_absent();
+    test_parse_control_json();
+    test_parse_control_unknown_key();
+
+    /* mqvpn_resolve_control_endpoint helper tests */
+    test_resolve_ini_only();
+    test_resolve_cli_port_overrides();
+    test_resolve_cli_addr_overrides();
+    test_resolve_explicit_disable();
+    test_resolve_no_input();
+    test_resolve_malformed_ini();
+    test_resolve_trailing_garbage_port();
+    test_resolve_port_leading_junk();
+
+    printf("\n=== test_config: %d passed, %d failed ===\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
+}
