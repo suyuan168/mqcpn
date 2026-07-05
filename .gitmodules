@@ -1,4 +1,4 @@
 [submodule "third_party/xquic"]
 	path = third_party/xquic
-	url = https://github.com/Ysurac/xquic
+	url = https://github.com/suyuan168/xquic
 	branch = mqvpn-omr-main
