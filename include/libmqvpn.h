@@ -468,6 +468,10 @@ MQVPN_API int mqvpn_config_set_reinjection(mqvpn_config_t *cfg, int enable);
 MQVPN_API int mqvpn_config_set_reinj_ctl(mqvpn_config_t *cfg, mqvpn_reinj_ctl_t ctl);
 MQVPN_API int mqvpn_config_set_fec(mqvpn_config_t *cfg, int enable);
 MQVPN_API int mqvpn_config_set_fec_scheme(mqvpn_config_t *cfg, mqvpn_fec_scheme_t scheme);
+/* Datagram redundancy (xquic datagram_redundancy): 0=off, 1=duplicate on any
+ * path (forces rap scheduler), 2=duplicate on a different path (forces
+ * minrtt). Enabling overrides the configured multipath scheduler. */
+MQVPN_API int mqvpn_config_set_datagram_redundancy(mqvpn_config_t *cfg, int mode);
 MQVPN_API int mqvpn_config_set_log_level(mqvpn_config_t *cfg, mqvpn_log_level_t level);
 MQVPN_API int mqvpn_config_set_multipath(mqvpn_config_t *cfg, int enable);
 MQVPN_API int mqvpn_config_set_reconnect(mqvpn_config_t *cfg, int enable,

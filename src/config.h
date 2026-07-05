@@ -74,6 +74,8 @@ typedef struct mqvpn_file_config_s {
     char reinjection_mode[16]; /* default|deadline|dgram */
     int fec_enable; /* 1=enable FEC, 0=off */
     char fec_scheme[32]; /* galois_calculation|packet_mask|reed_solomon|xor */
+    int datagram_redundancy; /* xquic datagram redundancy: 0=off, 1=dup on any path (rap),
+                              * 2=dup on a different path (minrtt). Overrides scheduler. */
     char cc[16]; /* congestion control: bbr2 (default), bbr, cubic, none */
 
     /* draft-21 §4.6 initial Maximum Path Identifier TP, 0 = use xquic default 8 */

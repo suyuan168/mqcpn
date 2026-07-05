@@ -1501,6 +1501,12 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
                                            XQC_REINJ_UNACK_BEFORE_SCHED |
                                            XQC_REINJ_UNACK_AFTER_SEND)
                                           : 0;
+    /* Datagram redundancy (near-zero-loss) for the server->client direction:
+     * xquic duplicates every DATAGRAM via reinjection (1=any path/rap,
+     * 2=different path/minrtt) and overrides the scheduler (xqc_conn.c). */
+    if (cfg->datagram_redundancy) {
+        conn_settings.datagram_redundancy = (uint8_t)cfg->datagram_redundancy;
+    }
     conn_settings.pacing_on = 1;
     conn_settings.max_pkt_out_size = 1400;
     switch (cfg->cc) {

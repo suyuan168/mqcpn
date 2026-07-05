@@ -1877,6 +1877,12 @@ cli_start_connection(mqvpn_client_t *c)
             ? (XQC_REINJ_UNACK_AFTER_SCHED | XQC_REINJ_UNACK_BEFORE_SCHED |
                XQC_REINJ_UNACK_AFTER_SEND)
             : 0;
+    /* Datagram redundancy (near-zero-loss): xquic duplicates every DATAGRAM
+     * via reinjection (1=any path/rap, 2=different path/minrtt) and overrides
+     * the scheduler accordingly (xqc_conn.c). Only meaningful with multipath. */
+    if (multipath && c->config.datagram_redundancy) {
+        cs.datagram_redundancy = (uint8_t)c->config.datagram_redundancy;
+    }
     cs.pacing_on = 1;
     cs.max_pkt_out_size = 1400;
     switch (c->config.cc) {

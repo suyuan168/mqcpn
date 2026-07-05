@@ -652,6 +652,20 @@ handle_kv(mqvpn_file_config_t *cfg, int section, const char *key, const char *va
             cfg->fec_enable = parse_bool(val);
         } else if (strcasecmp(key, "FecScheme") == 0) {
             snprintf(cfg->fec_scheme, sizeof(cfg->fec_scheme), "%s", val);
+        } else if (strcasecmp(key, "Redundancy") == 0 ||
+                   strcasecmp(key, "DatagramRedundancy") == 0) {
+            /* 0/off = disabled, 1/rap = duplicate on any path,
+             * 2/multipath = duplicate on a different path (recommended) */
+            if (strcasecmp(val, "multipath") == 0 || strcmp(val, "2") == 0) {
+                cfg->datagram_redundancy = 2;
+            } else if (strcasecmp(val, "rap") == 0 || strcmp(val, "1") == 0) {
+                cfg->datagram_redundancy = 1;
+            } else if (strcasecmp(val, "off") == 0 || strcmp(val, "0") == 0) {
+                cfg->datagram_redundancy = 0;
+            } else {
+                LOG_WRN("%s:%d: invalid Redundancy '%s' (0|1|2|off|rap|multipath)",
+                        path, lineno, val);
+            }
         } else if (strcasecmp(key, "Path") == 0) {
             if (cfg->n_paths < MQVPN_CONFIG_MAX_PATHS) {
                 snprintf(cfg->paths[cfg->n_paths], sizeof(cfg->paths[0]), "%s", val);

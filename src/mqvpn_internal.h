@@ -46,6 +46,7 @@ struct mqvpn_config_s {
     mqvpn_reinj_ctl_t reinj_ctl;
     int fec_enable;
     mqvpn_fec_scheme_t fec_scheme;
+    int datagram_redundancy; /* 0=off, 1=dup any path (rap), 2=dup different path (minrtt) */
     mqvpn_log_level_t log_level;
     int multipath;
     int reconnect_enable;

@@ -68,8 +68,35 @@ mqvpn_dgram_qos_level(mqvpn_scheduler_t s)
         return XQC_DATA_QOS_NORMAL;
     }
 #endif
+    /* OMR multipath-aggregation fix.
+     *
+     * Tagging datagrams QoS_HIGH (<= XQC_DATA_QOS_HIGH) sets XQC_POF_QOS_HIGH,
+     * which routes the packet to xquic's high-priority send queue. That queue
+     * is scheduled by xqc_conn_schedule_packets() with
+     * packets_are_limited_by_cc = XQC_FALSE (XQC_SEND_TYPE_NORMAL_HIGH_PRI),
+     * i.e. check_cwnd = 0. With check_cwnd = 0,
+     * xqc_scheduler_check_path_can_send() is always true, so the WLB/WRTT/RAP
+     * WRR always resolves to the single highest-weight path (the wired/best
+     * link) and the documented cwnd-block spillover to secondary paths can
+     * NEVER fire -- multipath UDP collapses onto one link. Measured on OMR:
+     * WAN driven to 2x its capacity @130M UDP (dropping ~50%) while the three
+     * cellular paths sat completely idle (0 B), across wlb/minrtt/rap/wrtt.
+     *
+     * Returning NORMAL (> XQC_DATA_QOS_HIGH) keeps datagrams in the
+     * cwnd-checked NORMAL queue, so the scheduler actually distributes packets
+     * across paths and spills to secondaries when the primary's cwnd is full.
+     * On FEC-less builds this carries no FEC/repair overhead. */
+    switch (s) {
+    case MQVPN_SCHED_WLB:
+    case MQVPN_SCHED_WLB_UDP_PIN:
+    case MQVPN_SCHED_WRTT:
+    case MQVPN_SCHED_RAP:
+        return XQC_DATA_QOS_NORMAL;
+    default:
+        break;
+    }
     (void)s;
-    return XQC_DATA_QOS_HIGH;
+    return XQC_DATA_QOS_HIGH; /* minrtt/backup: intentional single-path, keep latency */
 }
 
 #endif /* MQVPN_SCHEDULER_H */

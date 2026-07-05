@@ -29,6 +29,7 @@ typedef struct mqvpn_server_cfg_s {
     int reinjection_mode;           /* 0=default, 1=deadline, 2=dgram */
     int fec_enable;                 /* 1=enable FEC */
     int fec_scheme;                 /* 0=reed_solomon, 1=xor, 2=packet_mask, 3=galois_calculation */
+    int datagram_redundancy;        /* 0=off, 1=dup any path (rap), 2=dup different path (minrtt) */
     const char *auth_key;           /* PSK for client authentication (NULL = no auth) */
     const char *user_names[64];
     const char *user_keys[64];

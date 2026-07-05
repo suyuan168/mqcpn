@@ -544,6 +544,13 @@ mqvpn_config_load_json(mqvpn_config_t *cfg, const char *json_text)
         }
     }
 
+    /* datagram redundancy: 0=off, 1=dup on any path, 2=dup on a different path */
+    v = json_find_key(json_text, "redundancy");
+    if (!v) v = json_find_key(json_text, "datagram_redundancy");
+    if (v && json_read_int(v, &iv) == MQVPN_OK && iv >= 0 && iv <= 2) {
+        cfg->datagram_redundancy = iv;
+    }
+
     v = json_find_key(json_text, "reconnect_interval_sec");
     if (v && json_read_int(v, &iv) == MQVPN_OK) {
         cfg->reconnect_interval_sec = iv;
@@ -654,6 +661,15 @@ mqvpn_config_set_fec_scheme(mqvpn_config_t *cfg, mqvpn_fec_scheme_t scheme)
 {
     if (!cfg) return MQVPN_ERR_INVALID_ARG;
     cfg->fec_scheme = scheme;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_datagram_redundancy(mqvpn_config_t *cfg, int mode)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (mode < 0 || mode > 2) return MQVPN_ERR_INVALID_ARG;
+    cfg->datagram_redundancy = mode;
     return MQVPN_OK;
 }
 

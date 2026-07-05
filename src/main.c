@@ -430,6 +430,7 @@ main(int argc, char *argv[])
                                        : file_cfg.reinjection_mode;
     int eff_fec_enable = fec_enable >= 0 ? fec_enable : file_cfg.fec_enable;
     const char *eff_fec_scheme = fec_scheme_str ? fec_scheme_str : file_cfg.fec_scheme;
+    int eff_datagram_redundancy = file_cfg.datagram_redundancy;
     const char *eff_listen = listen_str ? listen_str : file_cfg.listen;
     const char *eff_subnet = subnet ? subnet : file_cfg.subnet;
     const char *eff_subnet6 =
@@ -645,6 +646,7 @@ main(int argc, char *argv[])
             .reinjection_mode = reinjection_mode,
             .fec_enable = eff_fec_enable,
             .fec_scheme = fec_scheme,
+            .datagram_redundancy = eff_datagram_redundancy,
             .cc = cc,
             .auth_key = eff_auth_key_client,
             .auth_username = eff_auth_username,
@@ -708,6 +710,7 @@ main(int argc, char *argv[])
             .reinjection_mode = reinjection_mode,
             .fec_enable = eff_fec_enable,
             .fec_scheme = fec_scheme,
+            .datagram_redundancy = eff_datagram_redundancy,
             .cc = cc,
             .auth_key = eff_auth_key,
             .n_users = eff_n_users,
