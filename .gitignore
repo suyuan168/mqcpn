@@ -1,0 +1,59 @@
+build/
+build-*/
+ref/
+benchmarks/*
+!benchmarks/*.sh
+!benchmarks/sweep_reorder_analyze.py
+# H2a micro-benchmark rig (harness + driver) is tracked
+!benchmarks/tcp_lane_microbench/
+
+# local-only picoquic build for reorder sweep / interop (not vendored as a submodule).
+# picotls is picoquic's sibling TLS dependency, cloned + built next to it.
+/third_party/picoquic/
+/third_party/picotls/
+# local sweep / bench results (never committed)
+/ci_sweep_results/
+/ci_bench_results/
+/ci_stress_results/
+# scratch drafts / abandoned scaffolds — kept on disk, never published
+/docs/tbd/
+!benchmarks/*.py
+*.o
+*.d
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+tests/test_flow_sched
+tests/test_config
+tests/test_auth
+tests/test_session
+tests/test_dns
+client.conf
+mise.toml
+codeql-db/
+
+# Gradle build cache
+android/.gradle/
+
+# NDK cross-compile prebuilt libraries
+android/sdk-native/prebuilt/
+
+# Android local build artifacts
+android/local.properties
+android/sdk-native/.cxx/
+
+# VitePress website
+website/node_modules/
+website/.vitepress/dist/
+website/.vitepress/cache/
+
+# Bench data is published to R2 (perf-data.mqvpn.org), not committed.
+website/public/perf-data/
+
+# Git worktrees
+.worktrees/
+
+# local-only bench notes (kept untracked by owner decision)
+docs/report/2026-07-03-hybrid-h2a-microbench.md
+docs/report/2026-07-04-hybrid-h2b-throughput.md

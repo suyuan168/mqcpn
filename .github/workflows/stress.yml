@@ -1,0 +1,218 @@
+name: Stress Tests
+
+on:
+  schedule:
+    - cron: '0 6 * * 0'  # Sunday 6:00 UTC (after perf-weekly at 3:00)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stress-test
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libevent-dev golang iptables iproute2 iperf3
+
+      # Cache keys end with -vN; bump on CMake-flag/compiler changes.
+      # Note: BoringSSL here uses -DBUILD_TESTING=OFF (different from the
+      # ci.yml sanitizer job), so this needs its own key, not a shared one.
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (clang fPIC, stress)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-clang-fpic-stress-v1
+
+      - name: Clone BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git \
+            third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl && git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+
+      - name: Build BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic/third_party/boringssl
+          mkdir -p build && cd build
+          CC=clang CXX=clang++ cmake -DBUILD_SHARED_LIBS=0 -DBUILD_TESTING=OFF \
+            -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j$(nproc) ssl crypto
+
+      - name: Cache xquic (clang Debug, stress)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          # See ci.yml "Cache xquic (Release)" comment re: xqc_configure.h
+          # — committed FEC=OFF default in source tree must travel with build/.
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-9c95ec7-stress-v3
+
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug -DSSL_TYPE=boringssl \
+            -DXQC_ENABLE_BBR2=ON \
+            -DXQC_ENABLE_FEC=ON \
+            -DXQC_ENABLE_XOR=ON \
+            -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" ..
+          make -j$(nproc)
+
+      - name: Build mqvpn (ASan + UBSan)
+        run: |
+          mkdir -p build && cd build
+          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_SANITIZERS=ON \
+            -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
+          make -j$(nproc)
+
+      - name: Upload build
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-build
+          path: |
+            build/mqvpn
+            build/libmqvpn.a
+            third_party/xquic/build/libxquic.so*
+          retention-days: 1
+
+  long-running:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install runtime deps
+        run: sudo apt-get update && sudo apt-get install -y libevent-dev iptables iproute2 iperf3
+      - uses: actions/download-artifact@v8
+        with:
+          name: stress-build
+      - name: Restore shared libs
+        run: |
+          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/ 2>/dev/null || true
+          sudo ldconfig
+      - name: Make executable
+        run: chmod +x build/mqvpn
+      - name: Long-running stress test (15min)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E bash scripts/ci_stress/ci_stress_long_running.sh build/mqvpn
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-long-running
+          path: ci_stress_results/
+          retention-days: 30
+
+  reconnect-storm:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install runtime deps
+        run: sudo apt-get update && sudo apt-get install -y libevent-dev iptables iproute2 iperf3
+      - uses: actions/download-artifact@v8
+        with:
+          name: stress-build
+      - name: Restore shared libs
+        run: |
+          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/ 2>/dev/null || true
+          sudo ldconfig
+      - name: Make executable
+        run: chmod +x build/mqvpn
+      - name: Reconnect storm (500 cycles)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E bash scripts/ci_stress/ci_stress_reconnect.sh build/mqvpn
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-reconnect
+          path: ci_stress_results/
+          retention-days: 30
+
+  multi-client:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install runtime deps
+        run: sudo apt-get update && sudo apt-get install -y libevent-dev iptables iproute2 iperf3
+      - uses: actions/download-artifact@v8
+        with:
+          name: stress-build
+      - name: Restore shared libs
+        run: |
+          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/ 2>/dev/null || true
+          sudo ldconfig
+      - name: Make executable
+        run: chmod +x build/mqvpn
+      - name: Multi-client stress (60 clients)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E bash scripts/ci_stress/ci_stress_multi_client.sh build/mqvpn
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-multi-client
+          path: ci_stress_results/
+          retention-days: 30
+
+  failover-storm:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install runtime deps
+        run: sudo apt-get update && sudo apt-get install -y libevent-dev iptables iproute2 iperf3
+      - uses: actions/download-artifact@v8
+        with:
+          name: stress-build
+      - name: Restore shared libs
+        run: |
+          sudo cp third_party/xquic/build/libxquic.so* /usr/local/lib/ 2>/dev/null || true
+          sudo ldconfig
+      - name: Make executable
+        run: chmod +x build/mqvpn
+      - name: Failover storm (100 cycles)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E bash scripts/ci_stress/ci_stress_failover.sh build/mqvpn
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-failover
+          path: ci_stress_results/
+          retention-days: 30

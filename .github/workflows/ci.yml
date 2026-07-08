@@ -1,0 +1,859 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  format-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check clang-format
+        run: |
+          FILES=$(find src include tests -name '*.c' -o -name '*.h' | grep -v third_party)
+          FAIL=0
+          for f in $FILES; do
+            if ! clang-format --dry-run --Werror "$f" 2>/dev/null; then
+              echo "needs formatting: $f"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -ne 0 ]; then
+            echo ""
+            echo "Fix: find src include tests -name '*.c' -o -name '*.h' | xargs clang-format -i"
+            exit 1
+          fi
+
+  build:
+    # Cache key conventions for BoringSSL / xquic / libevent-msan in this
+    # workflow: keys carry a trailing `-vN`. Bump that suffix in *every*
+    # affected job whenever you change CMake flags, configure commands, or
+    # compiler versions for the cached artifact — otherwise stale build
+    # outputs from a different configuration will be silently restored.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev golang iptables
+
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (gcc fPIC)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-gcc-fpic-v1
+
+      - name: Clone BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git \
+            third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl && git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+
+      - name: Build BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic/third_party/boringssl
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j$(nproc) ssl crypto
+
+      - name: Cache xquic (Release)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          # xquic's CMakeLists writes xqc_configure.h INTO the source tree
+          # (include/xquic/), not the build dir, and the committed default
+          # has FEC/XOR #undef. Cache restore without this header would
+          # leave the FEC=OFF version in place — mqvpn would then compile
+          # with the FEC-disabled code path even against an FEC-enabled
+          # libxquic.so, and reject --scheduler backup_fec at runtime.
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-gcc-release-bssl-9c95ec7-v4
+
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_BBR2=ON \
+                -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON \
+                -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j$(nproc)
+
+      - name: Build mqvpn
+        run: |
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
+          make -j$(nproc)
+
+      - name: Unit tests (ctest)
+        run: cd build && ctest --output-on-failure
+
+      - name: Stage artifacts
+        run: cp third_party/xquic/build/libxquic.so build/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build
+          path: |
+            build/mqvpn
+            build/libmqvpn.a
+            build/libmqvpn.so*
+            build/libxquic.so
+            build/cmake_install.cmake
+            build/systemd/
+          retention-days: 1
+
+  sanitizer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev golang iptables conntrack clang iperf3 jq netcat-openbsd iproute2
+
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (clang fPIC)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-clang-fpic-v1
+
+      - name: Clone BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git \
+            third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl && git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+
+      - name: Build BoringSSL (clang)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic/third_party/boringssl
+          mkdir -p build && cd build
+          CC=clang CXX=clang++ cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j$(nproc) ssl crypto
+
+      - name: Cache xquic (clang Debug)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          # See "Cache xquic (Release)" comment above re: xqc_configure.h.
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-9c95ec7-v4
+
+      - name: Build xquic (clang)
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_BBR2=ON \
+                -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON \
+                -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" ..
+          make -j$(nproc)
+
+      - name: Build mqvpn (clang + ASan + UBSan)
+        run: |
+          mkdir -p build && cd build
+          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug \
+                -DENABLE_SANITIZERS=ON \
+                -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
+                -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
+          make -j$(nproc)
+
+      - name: Unit tests (sanitizer)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: cd build && ctest --output-on-failure
+
+      - name: Fuzz tcp_lane (short budget)
+        run: |
+          mkdir -p build-fuzz && cd build-fuzz
+          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug \
+                -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
+                -DMQVPN_ENABLE_FUZZING=ON \
+                -DCMAKE_C_COMPILER=clang \
+                -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
+          make -j$(nproc) fuzz_tcp_lane
+          ASAN_OPTIONS=abort_on_error=1 \
+            ./fuzz_tcp_lane -max_total_time=120 ../fuzz/corpus/tcp_lane/
+
+      - name: E2E smoke test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_test.sh
+
+      - name: E2E multi-client test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/test_multiclient.sh
+
+      - name: E2E NAT test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_nat_test.sh
+
+      - name: E2E kill switch test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_killswitch_test.sh
+
+      - name: E2E reconnect test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_reconnect_test.sh
+
+      - name: E2E RTM_DELLINK test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_dellink_test.sh
+
+      - name: E2E runtime path add/remove API test (netns) [issue #4271/#4273]
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_path_api_test.sh
+
+      - name: E2E 8-path dellink at MQVPN_MAX_PATHS cap (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_8paths_dellink_test.sh
+
+      - name: E2E carrier-flap test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_carrier_flap_test.sh
+
+      - name: E2E admin-down recovery test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_admin_down_test.sh
+
+      - name: E2E addr-del failover test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_addr_del_failover_test.sh
+
+      - name: E2E validation black-hole test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_validation_blackhole_test.sh
+
+      - name: E2E backup_fec scheduler test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_backup_fec_test.sh
+
+      - name: E2E G-P10 proactive CID issuance (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_g_p10_proactive_cid_test.sh
+
+      - name: E2E G-P14 PATH_ABANDON alt-path (netns, SKIP)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_g_p14_path_abandon_altpath_test.sh
+
+      - name: E2E G-P15 STANDBY signal (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_g_p15_standby_signal_test.sh
+
+      - name: E2E G-P16 PATHS_BLOCKED emission (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_g_p16_paths_blocked_emission_test.sh
+
+      - name: E2E D1 IP-change cwnd/RTT reset (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_d1_ip_change_rebind_test.sh
+
+      - name: E2E D1 port-only retain (negative, netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_d1_port_only_retain_test.sh
+
+      - name: E2E IPv6 transport test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_ipv6_transport_test.sh
+
+      - name: E2E IPv6 data plane test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_ipv6_dataplane_test.sh
+
+      - name: E2E IPv6 multipath test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_ipv6_multipath_test.sh
+
+      - name: E2E IPv6 full multipath test (netns)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: sudo -E scripts/ci_e2e/run_ipv6_full_multipath_test.sh
+
+      - name: E2E control API test (netns) — control plane only
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          # Skip data-plane-heavy phases (iperf3 throughput, scheduler matrix)
+          # in CI; phases A/C/D/E/G cover the control-API contracts deterministically.
+          MQVPN_E2E_SKIP_PHASES: "B F"
+        run: sudo -E scripts/ci_e2e/run_control_api_test.sh
+
+  msan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake golang iptables clang
+
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libevent (MSan)
+        id: libevent-cache
+        uses: actions/cache@v6
+        with:
+          path: /tmp/libevent-msan
+          key: libevent-2.1.12-linux-clang-msan-v1
+
+      - name: Build libevent from source (MSan)
+        if: steps.libevent-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch release-2.1.12-stable https://github.com/libevent/libevent.git /tmp/libevent
+          cd /tmp/libevent && mkdir build && cd build
+          CC=clang cmake -DCMAKE_C_FLAGS="-fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins" \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DEVENT__DISABLE_OPENSSL=ON \
+                -DEVENT__DISABLE_BENCHMARK=ON \
+                -DEVENT__DISABLE_TESTS=ON \
+                -DEVENT__DISABLE_SAMPLES=ON \
+                -DCMAKE_INSTALL_PREFIX=/tmp/libevent-msan ..
+          make -j$(nproc) && make install
+
+      - name: Cache BoringSSL (clang MSan)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-clang-msan-v1
+
+      - name: Clone BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git \
+            third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl && git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+
+      - name: Build BoringSSL (clang + MSan)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic/third_party/boringssl
+          mkdir -p build && cd build
+          CC=clang CXX=clang++ cmake \
+            -DBUILD_SHARED_LIBS=0 \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_C_FLAGS="-fPIC -fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins -Wno-error=frame-larger-than" \
+            -DCMAKE_CXX_FLAGS="-fPIC -fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins -Wno-error=frame-larger-than" ..
+          make -j$(nproc) ssl crypto
+
+      - name: Cache xquic (clang MSan)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          # See "Cache xquic (Release)" comment above re: xqc_configure.h.
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-msan-bssl-9c95ec7-v4
+
+      - name: Build xquic (clang + MSan)
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_BBR2=ON \
+                -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON \
+                -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-fsanitize=memory -fno-omit-frame-pointer -fsanitize-memory-track-origins -Wno-unknown-warning-option" ..
+          make -j$(nproc)
+
+      - name: Build mqvpn (clang + MSan)
+        run: |
+          mkdir -p build && cd build
+          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug \
+                -DENABLE_MSAN=ON \
+                -DXQUIC_BUILD_DIR=../third_party/xquic/build \
+                -DCMAKE_PREFIX_PATH=/tmp/libevent-msan ..
+          make -j$(nproc)
+
+      - name: Unit tests (MSan)
+        env:
+          MSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: cd build && ctest --output-on-failure
+
+  netns-tests:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libevent-dev iptables iperf3
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build
+          path: build
+
+      - name: Make binary executable
+        run: chmod +x build/mqvpn
+
+      - name: Smoke test (netns)
+        run: sudo scripts/ci_e2e/run_test.sh
+
+      - name: Multi-client test (netns)
+        run: sudo scripts/ci_e2e/test_multiclient.sh
+
+      - name: NAT test (netns)
+        run: sudo scripts/ci_e2e/run_nat_test.sh
+
+      - name: Kill switch test (netns)
+        run: sudo scripts/ci_e2e/run_killswitch_test.sh
+
+      - name: Reconnect test (netns)
+        run: sudo scripts/ci_e2e/run_reconnect_test.sh
+
+      - name: RTM_DELLINK test (netns)
+        run: sudo scripts/ci_e2e/run_dellink_test.sh
+
+      - name: Runtime path add/remove API test (netns) [issue #4271/#4273]
+        run: sudo scripts/ci_e2e/run_path_api_test.sh
+
+      - name: Carrier-flap test (netns)
+        run: sudo scripts/ci_e2e/run_carrier_flap_test.sh
+
+      - name: Addr-del failover test (netns)
+        run: sudo scripts/ci_e2e/run_addr_del_failover_test.sh
+
+      - name: Throughput-floor regression test (netns)
+        run: sudo scripts/ci_e2e/run_throughput_floor_test.sh
+
+  ipv6-tests:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libevent-dev iptables
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build
+          path: build
+
+      - name: Make binary executable
+        run: chmod +x build/mqvpn
+
+      - name: IPv6 transport test (netns)
+        run: sudo scripts/ci_e2e/run_ipv6_transport_test.sh
+
+      - name: IPv6 data plane test (netns)
+        run: sudo scripts/ci_e2e/run_ipv6_dataplane_test.sh
+
+      - name: IPv6 multipath test (netns)
+        run: sudo scripts/ci_e2e/run_ipv6_multipath_test.sh
+
+      - name: IPv6 full multipath test (netns)
+        run: sudo scripts/ci_e2e/run_ipv6_full_multipath_test.sh
+
+  systemd-test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev iptables
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build
+          path: build
+
+      - name: Make binary executable
+        run: chmod +x build/mqvpn
+
+      - name: Restore libxquic.so for cmake install
+        run: |
+          mkdir -p third_party/xquic/build
+          cp build/libxquic.so third_party/xquic/build/
+
+      - name: Install mqvpn (system-wide)
+        run: cd build && sudo cmake --install . --prefix /usr/local
+
+      - name: Systemd service integration test
+        run: sudo scripts/ci_e2e/run_systemd_test.sh
+
+  windows:
+    # Pinned to windows-2022 (VS 2022). windows-latest migrated to VS 2026 in
+    # June 2026, where the hardcoded `-G "Visual Studio 17 2022"` generator finds
+    # no VS instance. Revisit (bump generator / Ninja) before windows-2022 retires.
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+
+      - name: Install libevent via vcpkg
+        run: vcpkg install libevent:x64-windows-static
+
+      - name: Compute xquic SHA
+        id: xqsha
+        shell: bash
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (MSVC)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-windows-msvc-v1
+
+      - name: Clone BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git `
+            third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl
+          git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+
+      - name: Build BoringSSL
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic/third_party/boringssl
+          mkdir build
+          cd build
+          cmake -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=0 ..
+          cmake --build . --target ssl --config Release
+          cmake --build . --target crypto --config Release
+
+      - name: Cache xquic (MSVC Release)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          # See "Cache xquic (Release)" comment above re: xqc_configure.h.
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-windows-msvc-release-bssl-9c95ec7-v4
+
+      - name: Build xquic
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir build
+          cd build
+          # CMAKE_C_STANDARD=11: xquic's MSVC enum-truncation patch uses
+          # _Static_assert (C11), and xquic upstream targets gnu11. Without
+          # /std:c11 cl.exe falls back to its pre-C11 dialect and the
+          # _Static_assert lines fail to compile.
+          cmake -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_STANDARD=11 `
+            -DSSL_TYPE=boringssl `
+            -DSSL_PATH="${{ github.workspace }}/third_party/xquic/third_party/boringssl" `
+            -DXQC_ENABLE_BBR2=ON `
+            -DXQC_ENABLE_UNLIMITED=ON `
+            -DXQC_ENABLE_FEC=ON `
+            -DXQC_ENABLE_XOR=ON ..
+          cmake --build . --config Release
+
+      - name: Build mqvpn
+        run: |
+          mkdir build
+          cd build
+          # Same C11 reasoning as the xquic build, kept consistent.
+          cmake -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_STANDARD=11 `
+            -DXQUIC_BUILD_DIR="${{ github.workspace }}/third_party/xquic/build/Release" `
+            -DBORINGSSL_BUILD_DIR="${{ github.workspace }}/third_party/xquic/third_party/boringssl/build/Release" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static ..
+          cmake --build . --config Release
+
+      - name: Verify binary
+        run: |
+          Test-Path build/Release/mqvpn.exe
+          Get-Item build/Release/mqvpn.exe | Select-Object Name, Length
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Compute NDK cache key
+        id: ndk-cache-key
+        run: |
+          XQUIC_SHA=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+')
+          echo "key=ndk-android-arm64-v8a-${{ hashFiles('scripts/build_android.sh', 'CMakeLists.txt', 'src/**/*.c', 'src/**/*.h', 'include/**/*.h') }}-${XQUIC_SHA}-bssl-9c95ec7" >> "$GITHUB_OUTPUT"
+
+      - name: Cache NDK prebuilt libraries
+        id: ndk-cache
+        uses: actions/cache@v6
+        with:
+          path: android/sdk-native/prebuilt
+          key: ${{ steps.ndk-cache-key.outputs.key }}
+
+      - name: Clone BoringSSL (pinned)
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/google/boringssl.git \
+            third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl
+          git fetch --depth 1 origin 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+          git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+
+      - name: NDK cross-compile (arm64-v8a)
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          # Find NDK: ANDROID_NDK_HOME > ANDROID_HOME/ndk/<latest> > default
+          if [ -n "${ANDROID_NDK_HOME:-}" ]; then
+            NDK_PATH="$ANDROID_NDK_HOME"
+          elif [ -d "${ANDROID_HOME}/ndk" ]; then
+            NDK_PATH="$(ls -d ${ANDROID_HOME}/ndk/*/ 2>/dev/null | sort -V | tail -1)"
+            NDK_PATH="${NDK_PATH%/}"
+          fi
+          echo "Using NDK: ${NDK_PATH}"
+          scripts/build_android.sh --abi arm64-v8a --ndk "$NDK_PATH"
+
+      - name: Verify prebuilt libraries
+        run: |
+          for lib in libmqvpn.a libxquic.a libssl.a libcrypto.a; do
+            test -f "android/sdk-native/prebuilt/arm64-v8a/${lib}" \
+              || { echo "MISSING: ${lib}"; exit 1; }
+          done
+          ls -lh android/sdk-native/prebuilt/arm64-v8a/
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Gradle build
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Unit tests (48 tests)
+        working-directory: android
+        run: ./gradlew test --no-daemon --stacktrace
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-test-reports
+          path: |
+            android/sdk-core/build/reports/tests/
+            android/sdk-runtime/build/reports/tests/
+            android/sdk-network/build/reports/tests/
+          retention-days: 7
+
+  lint-lifecycle-writes:
+    name: Lint - lifecycle field writes (spec §3.3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run check_lifecycle_field_writes.sh
+        env:
+          LINT_MODE: fail
+        run: bash scripts/lint/check_lifecycle_field_writes.sh
+
+  hybrid-e2e:
+    # H2 hybrid TCP-lane end-to-end suite (7 scenarios, incl. iperf3
+    # throughput ratios + a netem multipath-aggregation test). Runs in a
+    # dedicated NON-sanitized job on purpose: the throughput assertions are
+    # unreliable under ASan on shared runners (same reason the control-API
+    # e2e skips its data-plane phases in the sanitizer job). Reuses the same
+    # clang-Debug BoringSSL/xquic cache artifacts as the sanitizer job.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev golang iptables conntrack clang iperf3 jq netcat-openbsd curl python3
+
+      - name: Compute xquic SHA
+        id: xqsha
+        run: echo "sha=$(git submodule status third_party/xquic | awk '{print $1}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache BoringSSL (clang fPIC)
+        id: bssl-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/xquic/third_party/boringssl
+          key: bssl-9c95ec7-linux-clang-fpic-v1
+
+      - name: Clone BoringSSL (pinned)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/google/boringssl.git \
+            third_party/xquic/third_party/boringssl
+          cd third_party/xquic/third_party/boringssl && git checkout 9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c
+
+      - name: Build BoringSSL (clang)
+        if: steps.bssl-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic/third_party/boringssl
+          mkdir -p build && cd build
+          CC=clang CXX=clang++ cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j$(nproc) ssl crypto
+
+      - name: Cache xquic (clang Debug)
+        id: xquic-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/xquic/build
+            third_party/xquic/include/xquic/xqc_configure.h
+          key: xquic-${{ steps.xqsha.outputs.sha }}-linux-clang-debug-bssl-9c95ec7-v4
+
+      - name: Build xquic (clang)
+        if: steps.xquic-cache.outputs.cache-hit != 'true'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_BBR2=ON \
+                -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON \
+                -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" ..
+          make -j$(nproc)
+
+      - name: Build mqvpn (clang, hybrid lane, no sanitizers)
+        run: |
+          mkdir -p build && cd build
+          CC=clang cmake -DCMAKE_BUILD_TYPE=Debug \
+                -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
+                -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
+          make -j$(nproc)
+
+      - name: E2E hybrid H1 classifier/counters (netns)
+        run: sudo -E tests/test_e2e_hybrid_h1.sh build/mqvpn
+
+      - name: E2E hybrid H2 TCP-lane suite (netns)
+        run: sudo -E tests/test_e2e_hybrid_h2.sh build/mqvpn

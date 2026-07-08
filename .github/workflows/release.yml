@@ -1,0 +1,605 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  WINTUN_VER: "0.14.1"
+  WINTUN_SHA256: "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+  BORINGSSL_COMMIT: "9c95ec797c65fde9e8ddffc3888f0b8c1460fe4c"
+
+jobs:
+  build-release:
+    strategy:
+      matrix:
+        include:
+          # amd64 deb is intentionally built on 22.04, not ubuntu-latest.
+          # ubuntu-latest (24.04) links against libevent-2.1-7t64 (the t64
+          # transition rename), so dpkg-shlibdeps pins Depends: to a package
+          # name that does not exist on Ubuntu 22.04 / Debian 12. Building on
+          # 22.04 yields Depends: libevent-2.1-7, which is satisfied natively
+          # on 22.04 / Debian 12 and via Provides: libevent-2.1-7 on 24.04 /
+          # Debian 13. glibc 2.35 baseline is forward-compatible with all of
+          # those. arm64 stays on 24.04 because GitHub has no 22.04 ARM runner.
+          - { os: linux,   arch: amd64, runner: ubuntu-22.04     }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
+          # amd64 pinned to windows-2022 (VS 2022): windows-latest migrated to
+          # VS 2026 in June 2026, breaking the hardcoded "Visual Studio 17 2022"
+          # generator. Revisit (bump generator / Ninja) before windows-2022 retires.
+          - { os: windows, arch: amd64, runner: windows-2022     }
+          - { os: windows, arch: arm64, runner: windows-11-arm   }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Verify tag matches CMake version
+        shell: bash
+        run: |
+          # Use sed (BRE) instead of `grep -oP` because Git for Windows' grep
+          # rejects -P with the runner's default locale ("supports only unibyte
+          # and UTF-8 locales"). sed avoids the PCRE dependency entirely.
+          CMAKE_VERSION=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            # Skip the strict tag/CMake match for SemVer pre-release tags
+            # (e.g. v0.4.0-beta1) — CMake project(VERSION) only accepts
+            # numeric x.y.z, so the suffix is intentionally not in CMake.
+            if [[ "$TAG_VERSION" == *-* ]]; then
+              echo "Pre-release tag $TAG_VERSION — skipping strict version match"
+            elif [ "$TAG_VERSION" != "$CMAKE_VERSION" ]; then
+              echo "ERROR: Tag $TAG_VERSION != CMakeLists.txt $CMAKE_VERSION"
+              exit 1
+            fi
+          fi
+          echo "VERSION=$CMAKE_VERSION" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libevent-dev golang iptables
+
+      - name: Clone BoringSSL (pinned)
+        if: matrix.os == 'linux'
+        run: |
+          BSSL_DIR=third_party/xquic/third_party/boringssl
+          if [ ! -f "$BSSL_DIR/CMakeLists.txt" ]; then
+            git clone https://github.com/google/boringssl.git "$BSSL_DIR"
+          fi
+          cd "$BSSL_DIR" && git checkout ${{ env.BORINGSSL_COMMIT }}
+
+      - name: Build BoringSSL
+        if: matrix.os == 'linux'
+        run: |
+          cd third_party/xquic/third_party/boringssl
+          mkdir -p build && cd build
+          cmake -DBUILD_SHARED_LIBS=0 -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC" ..
+          make -j$(nproc) ssl crypto
+
+      - name: Build xquic
+        if: matrix.os == 'linux'
+        run: |
+          cd third_party/xquic
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DSSL_TYPE=boringssl \
+                -DXQC_ENABLE_BBR2=ON \
+                -DXQC_ENABLE_UNLIMITED=ON \
+                -DXQC_ENABLE_FEC=ON \
+                -DXQC_ENABLE_XOR=ON \
+                -DCMAKE_C_FLAGS="-Wno-dangling-pointer" ..
+          make -j$(nproc)
+
+      - name: Build mqvpn
+        if: matrix.os == 'linux'
+        run: |
+          mkdir -p build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr \
+                -DMQVPN_ENABLE_HYBRID_TCP_LANE=ON \
+                -DXQUIC_BUILD_DIR=../third_party/xquic/build ..
+          make -j$(nproc)
+
+      - name: Unit tests
+        if: matrix.os == 'linux'
+        run: cd build && ctest --output-on-failure
+
+      - name: Build deb package
+        if: matrix.os == 'linux'
+        run: cd build && cpack -G DEB
+
+      - name: Verify license files in deb
+        if: matrix.os == 'linux'
+        # OPTIONAL install rules in CMakeLists.txt silently skip missing
+        # third-party LICENSE files (needed for systemd-test which lacks
+        # submodules). This step is the release-side gate that confirms
+        # release builds — which DO check out submodules — actually bundle
+        # the four required files into the deb.
+        run: |
+          set -e
+          deb=$(ls build/mqvpn_*.deb)
+          expected=5
+          found=$(dpkg-deb -c "$deb" \
+                  | grep -cE 'usr/share/doc/mqvpn/(LICENSE|NOTICE|third-party/(xquic|boringssl|lwip)\.txt)$' \
+                  || true)
+          if [ "$found" -ne "$expected" ]; then
+            echo "::error::deb missing license files (found $found of $expected)"
+            dpkg-deb -c "$deb" | grep -E 'usr/share/doc/mqvpn|third-party' || echo "  (none found)"
+            exit 1
+          fi
+
+      - name: Generate tarball service files
+        if: matrix.os == 'linux'
+        run: |
+          mkdir -p build-tarball && cd build-tarball
+          cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local \
+                   -DXQUIC_BUILD_DIR=../third_party/xquic/build
+          # Only need the generated systemd files, not a full build
+
+      - name: Create tarball
+        if: matrix.os == 'linux'
+        run: |
+          STAGING="mqvpn_${VERSION}_${{ matrix.arch }}"
+          mkdir -p "$STAGING"/{bin,lib/mqvpn,systemd,etc/mqvpn}
+          cp build/mqvpn "$STAGING/bin/"
+          cp build/libmqvpn.so* "$STAGING/lib/" 2>/dev/null || true
+          cp third_party/xquic/build/libxquic.so "$STAGING/lib/"
+          cp scripts/mqvpn-server-nat.sh "$STAGING/lib/mqvpn/"
+          cp build-tarball/systemd/mqvpn-server.service "$STAGING/systemd/"
+          cp build-tarball/systemd/mqvpn-client@.service "$STAGING/systemd/"
+          cp systemd/server.conf.example "$STAGING/etc/mqvpn/"
+          cp systemd/client.conf.example "$STAGING/etc/mqvpn/"
+          cp LICENSE "$STAGING/"
+          cp NOTICE  "$STAGING/"
+          mkdir -p "$STAGING/third-party"
+          cp third_party/xquic/LICENSE                       "$STAGING/third-party/xquic.txt"
+          cp third_party/xquic/third_party/boringssl/LICENSE "$STAGING/third-party/boringssl.txt"
+          cp third_party/lwip/LICENSE                        "$STAGING/third-party/lwip.txt"
+          tar czf "mqvpn_${VERSION}_${{ matrix.arch }}.tar.gz" -C "$STAGING" .
+          rm -rf "$STAGING" build-tarball
+
+      - name: Verify license files in tarball
+        if: matrix.os == 'linux'
+        run: |
+          set -e
+          tarball=$(ls mqvpn_*.tar.gz)
+          expected=5
+          found=$(tar tzf "$tarball" \
+                  | grep -cE '^\./(LICENSE|NOTICE|third-party/(xquic|boringssl|lwip)\.txt)$' \
+                  || true)
+          if [ "$found" -ne "$expected" ]; then
+            echo "::error::tarball missing license files (found $found of $expected)"
+            tar tzf "$tarball" | grep -E 'LICENSE|NOTICE|third-party' || echo "  (none found)"
+            exit 1
+          fi
+
+      - name: Stage release artifacts
+        if: matrix.os == 'linux'
+        run: cp build/mqvpn_*.deb .
+
+      - name: Setup MSVC dev environment (Windows)
+        if: matrix.os == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch == 'amd64' && 'x64' || 'arm64' }}
+
+      - name: Install NASM (Windows)
+        if: matrix.os == 'windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Setup Go (Windows, BoringSSL build)
+        if: matrix.os == 'windows'
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+
+      - name: Install libevent via vcpkg (Windows)
+        if: matrix.os == 'windows'
+        run: vcpkg install libevent:${{ matrix.arch == 'amd64' && 'x64-windows-static' || 'arm64-windows-static' }}
+
+      # Cache key includes WINTUN_SHA256, so a hit implies the verified
+      # bytes — no re-verify on hit (trusts GitHub Actions cache integrity).
+      - name: Cache wintun
+        if: matrix.os == 'windows'
+        id: cache-wintun
+        uses: actions/cache@v6
+        with:
+          path: wintun-extract
+          key: wintun-${{ env.WINTUN_VER }}-${{ env.WINTUN_SHA256 }}
+
+      - name: Fetch and verify wintun (Windows)
+        if: matrix.os == 'windows' && steps.cache-wintun.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $zip = "wintun-${env:WINTUN_VER}.zip"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/$zip" -OutFile $zip
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $env:WINTUN_SHA256.ToLower()) {
+            Write-Error "wintun.zip sha256 mismatch: got $actual want $env:WINTUN_SHA256"
+            exit 1
+          }
+          Expand-Archive $zip -DestinationPath wintun-extract
+
+      - name: Clone BoringSSL (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $bssl = "third_party/xquic/third_party/boringssl"
+          if (-not (Test-Path "$bssl/CMakeLists.txt")) {
+            git clone https://github.com/google/boringssl.git $bssl
+          }
+          Push-Location $bssl
+          git checkout ${{ env.BORINGSSL_COMMIT }}
+          Pop-Location
+
+      - name: Build BoringSSL (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          cd third_party/xquic/third_party/boringssl
+          mkdir build
+          cd build
+          # OPENSSL_NO_ASM=1 on ARM64: works around BoringSSL CMake bug at
+          # the pinned commit that mis-routes ASM source selection on
+          # Windows ARM64 (pulls in x86_64-apple obj → LNK1181). Trade-off:
+          # ARM64 falls back to C crypto, measurably slower than amd64 for
+          # AES-GCM / SHA. Revisit when bumping BORINGSSL_COMMIT.
+          cmake -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
+            -DBUILD_SHARED_LIBS=0 `
+            ${{ matrix.arch == 'arm64' && '-DOPENSSL_NO_ASM=1' || '' }} ..
+          cmake --build . --target ssl --config Release
+          cmake --build . --target crypto --config Release
+
+      - name: Build xquic (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          cd third_party/xquic
+          mkdir build
+          cd build
+          # CMAKE_C_STANDARD=11: xquic upstream targets gnu11 (CMakeLists adds
+          # -std=gnu11 for GCC/Clang). cl.exe ignores that GCC-style flag, so
+          # we explicitly request /std:c11 to match the intended dialect.
+          # Does not fix the 64-bit enum issue (cl.exe always uses int as
+          # enum underlying type regardless of /std:c11) — that's handled by
+          # the xquic submodule patch (see fix/msvc-enum-truncation).
+          cmake -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_STANDARD=11 `
+            -DSSL_TYPE=boringssl `
+            -DSSL_PATH="${{ github.workspace }}/third_party/xquic/third_party/boringssl" `
+            -DXQC_ENABLE_BBR2=ON `
+            -DXQC_ENABLE_UNLIMITED=ON `
+            -DXQC_ENABLE_FEC=ON `
+            -DXQC_ENABLE_XOR=ON ..
+          cmake --build . --config Release
+
+      - name: Build mqvpn (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          mkdir build
+          cd build
+          # Same C11 reasoning as the xquic build, kept consistent across
+          # the two CMake invocations.
+          cmake -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'amd64' && 'x64' || 'ARM64' }} `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_STANDARD=11 `
+            -DXQUIC_BUILD_DIR="${{ github.workspace }}/third_party/xquic/build/Release" `
+            -DBORINGSSL_BUILD_DIR="${{ github.workspace }}/third_party/xquic/third_party/boringssl/build/Release" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.arch == 'amd64' && 'x64-windows-static' || 'arm64-windows-static' }} ..
+          cmake --build . --config Release
+
+      - name: Smoke test mqvpn.exe (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          # ctest is intentionally skipped on Windows: the registered tests
+          # (test_auth, test_config, test_dns, test_session) include POSIX
+          # headers / Linux-only platform sources, so they cannot be built
+          # under MSVC. CMakeLists.txt:197 guards the test block with
+          # `else()  # NOT WIN32 — Linux`, meaning ctest on Windows would
+          # silently pass on zero tests. Skipping makes that explicit.
+          # The smoke step below is the actual Windows build verification.
+          $out = & "build/Release/mqvpn.exe" --help 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "mqvpn.exe --help exited $LASTEXITCODE; output: $out"
+            exit 1
+          }
+          # Match the literal "Usage:" header that main.c:29 prints. Just
+          # matching "mqvpn" would be too loose (paths, runner output noise
+          # could match accidentally).
+          if (-not ($out -match '(?m)^Usage:')) {
+            Write-Error "mqvpn.exe --help did not print expected 'Usage:' banner; output: $out"
+            exit 1
+          }
+
+      - name: Stage Windows release artifact
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $staging = "mqvpn_${env:VERSION}_windows_${env:MATRIX_ARCH}"
+          $tpl = "$staging/THIRD_PARTY_LICENSES"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          New-Item -ItemType Directory -Force -Path $tpl | Out-Null
+
+          Copy-Item "build/Release/mqvpn.exe" "$staging/"
+          Copy-Item "third_party/xquic/build/Release/xquic.dll" "$staging/"
+          Copy-Item "wintun-extract/wintun/bin/${env:MATRIX_ARCH}/wintun.dll" "$staging/"
+          Copy-Item "packaging/windows/README.txt" "$staging/"
+
+          # Apache 2.0 §4(a) requires the License text to accompany binary
+          # distributions. mqvpn.exe (Apache 2.0) and xquic.dll (Apache 2.0,
+          # statically linking BoringSSL [Apache 2.0/ISC] and libevent
+          # [BSD-3-Clause]) all need their license text bundled. Wintun has
+          # its own license (separate copyright holder, WireGuard LLC).
+          # mqvpn's NOTICE (root-level) carries attribution for xquic and
+          # Wintun. BoringSSL is documented only via the bundled
+          # THIRD_PARTY_LICENSES/boringssl.txt (its per-file copyrights are
+          # numerous and live in source headers, not a project NOTICE).
+          Copy-Item "LICENSE" "$staging/LICENSE"
+          Copy-Item "NOTICE"  "$staging/NOTICE"
+          Copy-Item "third_party/xquic/LICENSE" "$tpl/xquic.txt"
+          Copy-Item "third_party/xquic/third_party/boringssl/LICENSE" "$tpl/boringssl.txt"
+          Copy-Item "wintun-extract/wintun/LICENSE.txt" "$tpl/wintun.txt"
+          $triplet = if ($env:MATRIX_ARCH -eq 'amd64') { 'x64-windows-static' } else { 'arm64-windows-static' }
+          $libevent_lic = "$env:VCPKG_INSTALLATION_ROOT/installed/$triplet/share/libevent/copyright"
+          if (-not (Test-Path $libevent_lic)) {
+            Write-Error "libevent copyright not found at $libevent_lic — vcpkg layout may have changed"
+            exit 1
+          }
+          Copy-Item $libevent_lic "$tpl/libevent.txt"
+
+          # Use explicit file list, NOT $staging/* glob. Compress-Archive's glob
+          # behavior varies subtly across PowerShell versions and has historically
+          # produced ZIPs with unexpected directory entries or dropped files near
+          # path-length limits. Explicit list also serves as a manifest.
+          $files = @(
+            "$staging/mqvpn.exe",
+            "$staging/xquic.dll",
+            "$staging/wintun.dll",
+            "$staging/README.txt",
+            "$staging/LICENSE",
+            "$staging/NOTICE",
+            "$staging/THIRD_PARTY_LICENSES"
+          )
+          Compress-Archive -Path $files -DestinationPath "mqvpn_${env:VERSION}_windows_${env:MATRIX_ARCH}.zip"
+          Remove-Item -Recurse $staging
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+
+      - name: Verify license files in Windows zip
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem "mqvpn_*_windows_*.zip" | Select-Object -First 1
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName)
+          $entries = @($archive.Entries | ForEach-Object { $_.FullName })
+          $archive.Dispose()
+          # Compress-Archive -Path with a file list emits flat entries
+          # (no staging-dir prefix). Anchor to ^ for precision.
+          $expected = @(
+            '^LICENSE$',
+            '^NOTICE$',
+            '^THIRD_PARTY_LICENSES/xquic\.txt$',
+            '^THIRD_PARTY_LICENSES/boringssl\.txt$',
+            '^THIRD_PARTY_LICENSES/wintun\.txt$',
+            '^THIRD_PARTY_LICENSES/libevent\.txt$'
+          )
+          $missing = @()
+          foreach ($pat in $expected) {
+            if (-not ($entries -match $pat)) { $missing += $pat }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Output "::error::Windows zip missing license files: $($missing -join ', ')"
+            Write-Output "entries:"
+            $entries | ForEach-Object { Write-Output "  $_" }
+            exit 1
+          }
+
+      - name: Upload Windows artifacts
+        if: matrix.os == 'windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-windows-${{ matrix.arch }}
+          path: mqvpn_*_windows_${{ matrix.arch }}.zip
+
+      - name: Upload artifacts
+        if: matrix.os == 'linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            mqvpn_*.deb
+            mqvpn_*_${{ matrix.arch }}.tar.gz
+
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Resolve version from CMakeLists.txt
+        run: |
+          CMAKE_VERSION=$(sed -n 's/^project(mqvpn VERSION \([0-9.][0-9.]*\).*/\1/p' CMakeLists.txt)
+          echo "VERSION=$CMAKE_VERSION" >> "$GITHUB_ENV"
+
+      - name: Clone BoringSSL (pinned)
+        run: |
+          BSSL_DIR=third_party/xquic/third_party/boringssl
+          if [ ! -f "$BSSL_DIR/CMakeLists.txt" ]; then
+            git clone https://github.com/google/boringssl.git "$BSSL_DIR"
+          fi
+          cd "$BSSL_DIR" && git checkout ${{ env.BORINGSSL_COMMIT }}
+
+      - name: Locate NDK
+        id: ndk
+        run: |
+          NDK_PATH=""
+          if [ -n "${ANDROID_NDK_HOME:-}" ]; then
+            NDK_PATH="$ANDROID_NDK_HOME"
+          elif [ -d "${ANDROID_HOME:-}/ndk" ]; then
+            NDK_PATH="$(ls -d ${ANDROID_HOME}/ndk/*/ 2>/dev/null | sort -V | tail -1)"
+            NDK_PATH="${NDK_PATH%/}"
+          fi
+          if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
+            echo "ERROR: NDK not found (ANDROID_NDK_HOME='${ANDROID_NDK_HOME:-}', ANDROID_HOME='${ANDROID_HOME:-}')"
+            exit 1
+          fi
+          echo "ndk_path=$NDK_PATH" >> "$GITHUB_OUTPUT"
+
+      # arm64-v8a only: matches sdk-native's abiFilters. APK will not run in
+      # x86_64 emulators — sample is for real-device evaluation. Expanding
+      # ABIs requires updating android/sdk-native/build.gradle.kts in lockstep.
+      - name: NDK cross-compile (arm64-v8a)
+        run: |
+          scripts/build_android.sh --abi arm64-v8a --ndk "${{ steps.ndk.outputs.ndk_path }}"
+
+      - name: Verify prebuilt libraries
+        run: |
+          for lib in libmqvpn.a libxquic.a libssl.a libcrypto.a; do
+            test -f "android/sdk-native/prebuilt/arm64-v8a/${lib}" \
+              || { echo "MISSING: arm64-v8a/${lib}"; exit 1; }
+          done
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # Ephemeral release keystore: generated fresh per CI run, so each
+      # release is signed with a different key. Acceptable for the sample
+      # APK (clearly labelled as demo); upgrades require uninstall+reinstall.
+      # If we later switch to a stable keystore, replace this step with one
+      # that decodes a base64 secret into release.jks instead.
+      - name: Generate ephemeral release keystore
+        run: |
+          KEYSTORE="$RUNNER_TEMP/release.jks"
+          # Single password for both store and key entry. JDK 9+ defaults
+          # keytool to PKCS12, which silently ignores a distinct -keypass
+          # during -genkeypair and encrypts the key with the storePassword
+          # — a separate keyPass would later trip BadPaddingException at
+          # APK-signing time. Using one password matches PKCS12 conventions.
+          PASS=$(openssl rand -base64 24)
+          keytool -genkeypair -v \
+            -keystore "$KEYSTORE" \
+            -storepass "$PASS" \
+            -keypass "$PASS" \
+            -alias mqvpn-release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=mqvpn sample, O=mqvpn, C=JP" >/dev/null
+          # Mask password in workflow logs; value is written only to the
+          # per-job env file ($GITHUB_ENV) which is scoped to this run.
+          echo "::add-mask::$PASS"
+          echo "MQVPN_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
+          echo "MQVPN_KEYSTORE_PASSWORD=$PASS" >> "$GITHUB_ENV"
+          echo "MQVPN_KEY_ALIAS=mqvpn-release" >> "$GITHUB_ENV"
+          echo "MQVPN_KEY_PASSWORD=$PASS" >> "$GITHUB_ENV"
+
+      # Stage license texts as assets/ before APK build. Android Gradle Plugin
+      # auto-includes src/main/assets/ in the produced APK. Required by
+      # Apache-2.0 §4(a) since the APK statically links xquic and BoringSSL.
+      - name: Stage license assets for APK
+        run: |
+          ASSETS=android/app/src/main/assets
+          mkdir -p "$ASSETS/third-party"
+          cp LICENSE                                         "$ASSETS/LICENSE"
+          cp NOTICE                                          "$ASSETS/NOTICE"
+          cp third_party/xquic/LICENSE                       "$ASSETS/third-party/xquic.txt"
+          cp third_party/xquic/third_party/boringssl/LICENSE "$ASSETS/third-party/boringssl.txt"
+
+      - name: Build signed release APK
+        working-directory: android
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Stage Android release artifact
+        run: |
+          SRC=android/app/build/outputs/apk/release/app-release.apk
+          test -f "$SRC" || { echo "APK not found at $SRC"; ls -R android/app/build/outputs/apk/ || true; exit 1; }
+          cp "$SRC" "mqvpn-sample_${VERSION}_android.apk"
+
+      - name: Verify license assets in APK
+        run: |
+          set -e
+          apk=$(ls mqvpn-sample_*_android.apk)
+          expected=4
+          found=$(unzip -l "$apk" \
+                  | grep -cE 'assets/(LICENSE|NOTICE|third-party/(xquic|boringssl)\.txt)$' \
+                  || true)
+          if [ "$found" -ne "$expected" ]; then
+            echo "::error::APK missing license assets (found $found of $expected)"
+            unzip -l "$apk" | grep -E 'assets/' || echo "  (none found)"
+            exit 1
+          fi
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-android
+          path: mqvpn-sample_*_android.apk
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-release, build-android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          # nullglob so missing pattern → empty rather than the literal pattern
+          # passed to sha256sum (would fail "No such file or directory").
+          shopt -s nullglob
+          sha256sum mqvpn_*.tar.gz mqvpn_*.deb mqvpn_*.zip mqvpn-sample_*_android.apk > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARS=(artifacts/mqvpn_*.tar.gz)
+          DEBS=(artifacts/mqvpn_*.deb)
+          ZIPS=(artifacts/mqvpn_*.zip)
+          APKS=(artifacts/mqvpn-sample_*_android.apk)
+          # SemVer pre-release identifier (anything after '-') → mark as
+          # pre-release so it does not become the "Latest" release.
+          # e.g. v0.4.0-beta1, v0.4.0-rc.1 → pre-release; v0.4.0 → latest.
+          PRERELEASE_FLAG=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          # Body intentionally left empty — auto-generated notes are too noisy
+          # (auto-sync upstream PRs, perf bench commits, etc. clutter the changelog).
+          # Edit release notes manually after publish via GitHub UI or:
+          #   gh release edit "$GITHUB_REF_NAME" --notes "..."
+          gh release create "$GITHUB_REF_NAME" \
+            --title "mqvpn v${VERSION}" \
+            --notes "" \
+            $PRERELEASE_FLAG \
+            "${TARS[@]}" "${DEBS[@]}" "${ZIPS[@]}" "${APKS[@]}" \
+            artifacts/SHA256SUMS \
+            scripts/install.sh \
+            LICENSE \
+            NOTICE
