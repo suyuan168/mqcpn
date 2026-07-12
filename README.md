@@ -9,7 +9,7 @@ Multipath QUIC VPN using [MASQUE CONNECT-IP (RFC 9484)](https://www.rfc-editor.o
 - **Multipath** — Bind multiple interfaces (WiFi + LTE, dual ISP). Seamless failover and bandwidth aggregation via WLB or WRTT scheduler.
 - **Standards-based** — MASQUE CONNECT-IP (RFC 9484), no proprietary tunnel format.
 - **Dual-stack** — IPv4 + IPv6 inside the tunnel.
-- **Multi-Platform** — Available on Linux (server/client), Windows (client only) and Android (client only) support.
+- **Multi-Platform** — Available on Linux (server/client), Windows (client only), macOS (client only) and Android (client only) support.
 - **PSK auth** — Pre-shared key over TLS 1.3.
 - **DNS override** — Prevents DNS leaks. Uses `resolvectl` on systemd-resolved systems, falls back to resolv.conf.
 
@@ -80,6 +80,10 @@ sudo dpkg -i mqvpn_*.deb
 ### Windows client
 
 Pre-built binaries are shipped for Windows amd64 and arm64. Download `mqvpn_<VERSION>_windows_<ARCH>.zip` from [Releases](https://github.com/mp0rta/mqvpn/releases/latest), extract, and follow the bundled `README.txt` (admin PowerShell required).
+
+### macOS client
+
+Pre-built binaries are shipped for Apple silicon (arm64). Download `mqvpn_<VERSION>_darwin_arm64.tar.gz` from [Releases](https://github.com/mp0rta/mqvpn/releases/latest), extract, and follow the bundled `README.txt` (sudo required).
 
 ## Quick Start
 
@@ -294,6 +298,33 @@ paths automatically (cwnd-block fallback). Path weights are set at runtime via
 when you need fine-grained per-link preference in addition to aggregation — for
 example, to prioritise a high-bandwidth fibre link over a metered LTE backup
 while still drawing on both under load.
+
+## Reorder buffer (datagram lane)
+
+A single inner UDP/QUIC flow striped across paths with different RTTs arrives
+reordered, and many inner protocols treat reorder as loss and back off. The
+reorder buffer holds datagrams in a short receive-side window and releases them
+in order, so one inner flow can aggregate both paths — the datagram-lane
+counterpart to what the [hybrid TCP stream lane](#hybrid-mode-tcp-lane) does for
+TCP. Off by default; negotiated end-to-end (both client and server must enable
+it) and a no-op when either side has it off.
+
+```ini
+[Reorder]
+Enabled = on
+MaxWaitMs = 50           # reorder window: hold out-of-order datagrams up to this long
+CapPackets = 1024        # per-flow buffer cap (packets)
+
+# Optional: target specific inner flows with a tuned preset
+[ReorderRule]
+Proto = udp
+Port = 443
+Profile = cellular_bond  # cellular_bond (wait=50ms, cap=1024) | fiber_lte (wait=50ms, cap=2048)
+```
+
+INI/JSON only (no CLI flag). Best on asymmetric-RTT path pairs (e.g. Wi-Fi +
+LTE); for symmetric, loss-dominated paths leave it off. See
+[docs/report/](docs/report/) for the parameter sweep and measured numbers.
 
 ## Hybrid mode (TCP lane)
 
