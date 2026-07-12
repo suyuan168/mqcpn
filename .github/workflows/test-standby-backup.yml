@@ -165,7 +165,7 @@ jobs:
 
       - name: Upload benchmark results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: standby-backup-perf-${{ github.sha }}
           path: ci_bench_results/standby_backup_*.json
